@@ -2,6 +2,9 @@
 
 use crate::input::Diagram;
 
+/// What mer says about input that holds no diagram.
+pub const NO_DIAGRAM: &str = "no Mermaid diagram found";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub message: String,

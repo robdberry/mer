@@ -157,14 +157,9 @@ fn load(cli: &Cli) -> Result<Vec<Diagram>> {
     Ok(diagrams)
 }
 
-fn no_diagrams() -> ExitCode {
-    eprintln!("mer: no Mermaid diagram found");
-    ExitCode::from(1)
-}
-
 fn check(settings: &Settings, diagrams: &[Diagram]) -> Result<ExitCode> {
     if diagrams.is_empty() {
-        return Ok(no_diagrams());
+        return Ok(display::no_diagrams());
     }
     let theme = settings.theme.as_deref().unwrap_or("default");
     let engine = Engine::new(display::site_config(theme, None, settings.mermaid.as_ref()), None);
@@ -188,7 +183,7 @@ fn check(settings: &Settings, diagrams: &[Diagram]) -> Result<ExitCode> {
 
 fn export(cli: &Cli, settings: &Settings, diagrams: &[Diagram], output: &Path) -> Result<ExitCode> {
     if diagrams.is_empty() {
-        return Ok(no_diagrams());
+        return Ok(display::no_diagrams());
     }
     let to_stdout = output.as_os_str() == "-";
     let format = match (cli.format, output.extension().and_then(|e| e.to_str())) {

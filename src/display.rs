@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::cli::Protocol;
-use crate::diag::{self, Diagnostic};
+use crate::diag::{self, NO_DIAGRAM};
 use crate::engine::{Control, Engine, Failure};
 use crate::fonts;
 use crate::input::Diagram;
@@ -124,8 +124,7 @@ impl Setup {
 /// Draws each diagram inline, in order, and leaves it in the scrollback.
 pub fn show(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
     if diagrams.is_empty() {
-        eprintln!("mer: no Mermaid diagram found");
-        return Ok(ExitCode::from(1));
+        return Ok(no_diagrams());
     }
     if setup.text {
         return show_text(setup, diagrams);
@@ -284,15 +283,15 @@ pub fn background(spec: Option<&str>, theme: &str, palette: Option<&Palette>) ->
 }
 
 pub fn report(failure: &Failure, diagram: &Diagram, color: bool) {
-    let diagnostic = match failure {
-        Failure::Diagnostic(diagnostic) => diagnostic.clone(),
-        Failure::Empty => Diagnostic {
-            message: "no Mermaid diagram found".to_string(),
-            span: None,
-        },
-        Failure::Cancelled => return,
-    };
-    eprint!("{}", diag::format(&diagnostic, diagram, color));
+    if let Some(diagnostic) = failure.diagnostic() {
+        eprint!("{}", diag::format(&diagnostic, diagram, color));
+    }
+}
+
+/// Says that the input holds no diagram, and exits 1.
+pub fn no_diagrams() -> ExitCode {
+    eprintln!("mer: {NO_DIAGRAM}");
+    ExitCode::from(1)
 }
 
 #[cfg(test)]

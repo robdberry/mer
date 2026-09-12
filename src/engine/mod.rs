@@ -14,7 +14,7 @@ use merman::{
 };
 use serde_json::Value;
 
-use crate::diag::Diagnostic;
+use crate::diag::{Diagnostic, NO_DIAGRAM};
 
 pub use merman::OperationControl as Control;
 
@@ -29,6 +29,20 @@ pub enum Failure {
     Empty,
     Diagnostic(Diagnostic),
     Cancelled,
+}
+
+impl Failure {
+    /// What to tell the user. A cancelled render isn't an error and has nothing to say.
+    pub fn diagnostic(&self) -> Option<Diagnostic> {
+        match self {
+            Failure::Empty => Some(Diagnostic {
+                message: NO_DIAGRAM.to_string(),
+                span: None,
+            }),
+            Failure::Diagnostic(diagnostic) => Some(diagnostic.clone()),
+            Failure::Cancelled => None,
+        }
+    }
 }
 
 impl Engine {

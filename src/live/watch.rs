@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use anyhow::Result;
 
 use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim, spawn_poller};
-use crate::diag::{self, Diagnostic};
+use crate::diag::{self, NO_DIAGRAM};
 use crate::display::Setup;
 use crate::engine::Failure;
 use crate::input::{self, Diagram};
@@ -139,7 +139,7 @@ impl Watch {
             self.notes = vec![
                 self.problem
                     .clone()
-                    .unwrap_or_else(|| "no Mermaid diagram found".to_string()),
+                    .unwrap_or_else(|| NO_DIAGRAM.to_string()),
             ];
             self.status = self.paths[0].display().to_string();
             return self.draw(Picture::None);
@@ -171,14 +171,9 @@ impl Watch {
                 self.status = format!("{position} · {} ms", frame.elapsed.as_millis());
                 self.draw(Picture::New(&frame))
             }
-            Err(Failure::Cancelled) => Ok(()),
             Err(failure) => {
-                let diagnostic = match failure {
-                    Failure::Diagnostic(diagnostic) => diagnostic,
-                    _ => Diagnostic {
-                        message: "no Mermaid diagram found".to_string(),
-                        span: None,
-                    },
+                let Some(diagnostic) = failure.diagnostic() else {
+                    return Ok(());
                 };
                 // Room for the error below whatever is still shown.
                 let shown = self.session.region.lines_for_image();

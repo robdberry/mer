@@ -19,7 +19,7 @@ use resvg::{tiny_skia, usvg};
 use serde_json::Value;
 
 use super::{Mailbox, Msg, Outcome, Session, TICK, dim, fit_line, spawn_poller, write_stdout};
-use crate::diag::{self, Diagnostic};
+use crate::diag::{self, Diagnostic, NO_DIAGRAM};
 use crate::display::Setup;
 use crate::engine::{Control, Engine, Failure};
 use crate::input::{self, Diagram};
@@ -296,7 +296,7 @@ impl Viewer {
         }
         self.stale = false;
         let Some(diagram) = self.diagrams.get(self.index) else {
-            self.notes = vec!["no Mermaid diagram found".to_string()];
+            self.notes = vec![NO_DIAGRAM.to_string()];
             return self.draw_notes();
         };
         let job = Job {
@@ -333,14 +333,9 @@ impl Viewer {
                 }
                 self.draw(&shot)
             }
-            Err(Failure::Cancelled) => Ok(()),
             Err(failure) => {
-                let diagnostic = match failure {
-                    Failure::Diagnostic(diagnostic) => diagnostic,
-                    _ => Diagnostic {
-                        message: "no Mermaid diagram found".to_string(),
-                        span: None,
-                    },
+                let Some(diagnostic) = failure.diagnostic() else {
+                    return Ok(());
                 };
                 self.notes = diag::format(&diagnostic, &self.diagrams[self.index], true)
                     .lines()

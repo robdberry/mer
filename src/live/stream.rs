@@ -345,8 +345,7 @@ impl Live {
             return Ok(ExitCode::from(code));
         }
         if self.found == 0 {
-            eprintln!("mer: no Mermaid diagram found");
-            return Ok(ExitCode::from(1));
+            return Ok(display::no_diagrams());
         }
         Ok(if self.failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
     }
