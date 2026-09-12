@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use super::{Msg, Outcome, Picture, Session, TICK, dim};
+use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim};
 use crate::display::{self, Setup};
 use crate::engine::Failure;
 use crate::input::markdown::{Fence, Scanner};
@@ -52,8 +52,9 @@ pub fn run(setup: Setup, format: Option<Format>) -> Result<ExitCode> {
         }
     }
 
+    let worker = Worker::spawn(setup.config.clone(), setup.background, messages.clone());
     let session = Session::start(&setup, messages)?;
-    let mut live = Live::new(setup, session, format);
+    let mut live = Live::new(setup, session, worker, format);
     live.feed(&bytes);
     live.run(inbox)
 }
@@ -88,6 +89,7 @@ enum Busy {
 struct Live {
     setup: Setup,
     session: Session,
+    worker: Worker,
     /// The format given with `--stdin-format`, if any.
     fixed_format: Option<Format>,
     /// The format of the document being received, once known.
@@ -111,10 +113,11 @@ struct Live {
 }
 
 impl Live {
-    fn new(setup: Setup, session: Session, format: Option<Format>) -> Live {
+    fn new(setup: Setup, session: Session, worker: Worker, format: Option<Format>) -> Live {
         Live {
             setup,
             session,
+            worker,
             fixed_format: format,
             format,
             partial: Vec::new(),
@@ -153,7 +156,7 @@ impl Live {
                 }
                 Some(Msg::Input(event)) => outcome = outcome.or(self.session.handle(&event)),
                 Some(Msg::Rendered(result)) => self.rendered(result)?,
-                Some(Msg::Changed) | None => {}
+                Some(Msg::Changed | Msg::Viewed(_)) | None => {}
             }
             match outcome {
                 Outcome::Quit(code) => break Some(code),
@@ -262,7 +265,8 @@ impl Live {
             return;
         }
         if let Some(diagram) = self.queue.pop_front() {
-            self.session.submit(diagram.text.clone(), self.session.grid, self.setup.fit);
+            let job = self.session.job(diagram.text.clone(), self.session.grid, self.setup.fit);
+            self.worker.submit(job);
             self.busy = Some(Busy::Final(diagram));
             return;
         }
@@ -278,7 +282,8 @@ impl Live {
             rows: self.session.grid.rows.saturating_sub(2).max(1),
             ..self.session.grid
         };
-        self.session.submit(self.text[..complete].to_string(), grid, Fit::Contain);
+        let job = self.session.job(self.text[..complete].to_string(), grid, Fit::Contain);
+        self.worker.submit(job);
         self.busy = Some(Busy::Preview);
     }
 

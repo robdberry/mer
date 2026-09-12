@@ -3,15 +3,13 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 
 use anyhow::Result;
 
-use super::{Msg, Outcome, Picture, Session, TICK, dim};
+use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim, spawn_poller};
 use crate::diag::{self, Diagnostic};
 use crate::display::Setup;
 use crate::engine::Failure;
@@ -20,16 +18,15 @@ use crate::render::Frame;
 use crate::size::{Fit, Grid};
 use crate::term::input::{Event, Key};
 
-/// How often the files are checked for changes.
-const POLL: Duration = Duration::from_millis(150);
-
 pub fn run(setup: Setup, paths: Vec<PathBuf>, selected: Option<usize>) -> Result<ExitCode> {
     let (messages, inbox) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     spawn_poller(paths.clone(), messages.clone(), Arc::clone(&stop));
+    let worker = Worker::spawn(setup.config.clone(), setup.background, messages.clone());
     let session = Session::start(&setup, messages)?;
     let mut watch = Watch {
         session,
+        worker,
         paths,
         diagrams: Vec::new(),
         index: selected.map_or(0, |n| n.saturating_sub(1)),
@@ -45,31 +42,9 @@ pub fn run(setup: Setup, paths: Vec<PathBuf>, selected: Option<usize>) -> Result
     result
 }
 
-/// Polls file size and modification time, which also catches editors that save by renaming.
-fn spawn_poller(paths: Vec<PathBuf>, messages: Sender<Msg>, stop: Arc<AtomicBool>) {
-    thread::spawn(move || {
-        let stamps = || -> Vec<_> {
-            paths
-                .iter()
-                .map(|path| fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok())))
-                .collect()
-        };
-        let mut last = stamps();
-        while !stop.load(Ordering::Relaxed) {
-            thread::sleep(POLL);
-            let now = stamps();
-            if now != last {
-                last = now;
-                if messages.send(Msg::Changed).is_err() {
-                    return;
-                }
-            }
-        }
-    });
-}
-
 struct Watch {
     session: Session,
+    worker: Worker,
     paths: Vec<PathBuf>,
     diagrams: Vec<Diagram>,
     index: usize,
@@ -100,7 +75,7 @@ impl Watch {
                     self.key(&event);
                 }
                 Some(Msg::Rendered(result)) => self.rendered(result)?,
-                Some(Msg::Stdin(_) | Msg::StdinEnd) | None => {}
+                Some(Msg::Stdin(_) | Msg::StdinEnd | Msg::Viewed(_)) | None => {}
             }
             match outcome {
                 Outcome::Quit(code) => break code,
@@ -174,8 +149,8 @@ impl Watch {
             rows: self.session.grid.rows.saturating_sub(reserved + 1).max(1),
             ..self.session.grid
         };
-        let source = diagram.text.clone();
-        self.session.submit(source, grid, Fit::Contain);
+        let job = self.session.job(diagram.text.clone(), grid, Fit::Contain);
+        self.worker.submit(job);
         self.busy = true;
         Ok(())
     }

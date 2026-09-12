@@ -11,7 +11,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,12 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
     haystack.windows(needle.len()).filter(|window| *window == needle).count()
 }
 
+/// `openpty` is not thread-safe on macOS, and a child spawned by another test while fresh pty
+/// descriptors are still inheritable would hold them open. Terminals and children are created
+/// one at a time under this lock.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Opens a pseudo-terminal pair. Call with `SPAWN` held.
 fn open_pty() -> (OwnedFd, OwnedFd) {
     let (mut master, mut slave) = (0, 0);
     let mut size = libc::winsize {
@@ -96,6 +102,9 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
         )
     };
     assert_eq!(status, 0, "openpty: {}", std::io::Error::last_os_error());
+    for fd in [master, slave] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
@@ -119,6 +128,7 @@ struct Terminal {
 
 impl Terminal {
     fn spawn(args: &[&str], stdin: Stdin, replies: &'static [u8]) -> Terminal {
+        let spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
         let (master, slave) = open_pty();
         let mut command = Command::new(MER);
         command
@@ -141,6 +151,7 @@ impl Terminal {
         let mut child = command.spawn().expect("spawn mer");
         drop(command);
         drop(slave);
+        drop(spawning);
 
         let mut master = File::from(master);
         let mut answer = master.try_clone().unwrap();
@@ -248,11 +259,16 @@ fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, replies: &'static [u8]
 }
 
 fn run_plain(args: &[&str]) -> Run {
-    let out = Command::new(MER)
+    let spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+    let child = Command::new(MER)
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    drop(spawning);
+    let out = child.wait_with_output().unwrap();
     Run {
         status: out.status.code().unwrap_or(-1),
         output: out.stdout,
@@ -593,6 +609,42 @@ fn watch_redraws_when_the_file_changes() {
     let images = images(&run.output);
     assert!(images.len() >= 2);
     assert!(images[1].size.0 > images[0].size.0, "the longer chain is wider");
+}
+
+#[test]
+fn viewer_pans_zooms_and_quits() {
+    let mut terminal =
+        Terminal::spawn(&["-i", &fixture("flowchart.mmd")], Stdin::Terminal, GHOSTTY);
+    terminal.wait_for("the first frame", |out| {
+        contains(out, b"\x1b[?1049h") && count(out, TRANSMIT) >= 1
+    });
+    let steps: [(&[u8], usize); 3] = [(b"+", 2), (b"l", 3), (b"\x1b[<64;600;400M", 4)];
+    for (keys, frames) in steps {
+        terminal.type_keys(keys);
+        terminal.wait_for("another frame", |out| count(out, TRANSMIT) >= frames);
+    }
+    terminal.type_keys(b"q");
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert!(contains(&run.output, b"\x1b[?1049l"), "left the alternate screen");
+    let images = images(&run.output);
+    let viewport = (u32::from(COLS) * CELL.0, u32::from(ROWS - 1) * CELL.1);
+    assert!(images.iter().all(|image| image.size == viewport));
+    assert!(images[0].rgba != images[1].rgba, "zooming changed the picture");
+    assert!(images[1].rgba != images[2].rgba, "panning changed the picture");
+    assert!(images[2].rgba != images[3].rgba, "scrolling zoomed the picture");
+}
+
+#[test]
+fn viewer_moves_between_diagrams() {
+    let mut terminal = Terminal::spawn(&["-i", &fixture("doc.md")], Stdin::Terminal, GHOSTTY);
+    terminal.wait_for("the first diagram", |out| contains(out, " · 1/2 · ".as_bytes()));
+    terminal.type_keys(b"n");
+    terminal.wait_for("the second diagram", |out| contains(out, " · 2/2 · ".as_bytes()));
+    terminal.type_keys(b"q");
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert!(images(&run.output).len() >= 2);
 }
 
 #[test]

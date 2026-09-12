@@ -44,15 +44,21 @@ pub fn render(
     size: (u32, u32),
     background: Option<Rgb>,
 ) -> tiny_skia::Pixmap {
+    render_transform(tree, tiny_skia::Transform::from_scale(scale, scale), size, background)
+}
+
+/// Renders `tree` through `transform` into a frame of `size` pixels.
+pub fn render_transform(
+    tree: &usvg::Tree,
+    transform: tiny_skia::Transform,
+    size: (u32, u32),
+    background: Option<Rgb>,
+) -> tiny_skia::Pixmap {
     let mut pixmap = tiny_skia::Pixmap::new(size.0.max(1), size.1.max(1)).expect("frame fits");
     if let Some(Rgb(r, g, b)) = background {
         pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, 255));
     }
-    resvg::render(
-        tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
+    resvg::render(tree, transform, &mut pixmap.as_mut());
     pixmap
 }
 

@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(short = 'w', long)]
     pub watch: bool,
 
+    /// Full-screen viewer: pan with the arrow keys or mouse, zoom with +/- or the scroll wheel
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+
     /// Parse and lay out every diagram without displaying; exit 1 on errors
     #[arg(long)]
     pub check: bool,

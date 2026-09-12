@@ -4,9 +4,12 @@
 //! feed one channel. The main loop owns all terminal output.
 
 pub mod stream;
+pub mod viewer;
 pub mod watch;
 
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -31,6 +34,8 @@ use crate::theme::{Palette, Rgb};
 pub const TICK: Duration = Duration::from_millis(25);
 /// After a light/dark switch, color replies are collected this long before re-rendering.
 const RECOLOR_DELAY: Duration = Duration::from_millis(150);
+/// How often watched files are checked for changes.
+const POLL: Duration = Duration::from_millis(150);
 
 pub enum Msg {
     Input(Event),
@@ -38,6 +43,7 @@ pub enum Msg {
     StdinEnd,
     Changed,
     Rendered(Result<Frame, Failure>),
+    Viewed(Box<viewer::Viewed>),
 }
 
 pub struct Job {
@@ -131,6 +137,69 @@ impl Drop for Worker {
     }
 }
 
+/// A one-job slot between the main loop and a worker thread. A job that hasn't been taken yet
+/// is merged into the job that replaces it.
+pub struct Mailbox<J> {
+    shared: Arc<(Mutex<MailboxState<J>>, Condvar)>,
+}
+
+struct MailboxState<J> {
+    job: Option<J>,
+    closed: bool,
+}
+
+impl<J> Clone for Mailbox<J> {
+    fn clone(&self) -> Self {
+        Mailbox {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<J> Mailbox<J> {
+    pub fn new() -> Mailbox<J> {
+        let state = MailboxState {
+            job: None,
+            closed: false,
+        };
+        Mailbox {
+            shared: Arc::new((Mutex::new(state), Condvar::new())),
+        }
+    }
+
+    pub fn put_with(&self, job: J, merge: impl FnOnce(J, J) -> J) {
+        let (lock, ready) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let job = match state.job.take() {
+            Some(waiting) => merge(job, waiting),
+            None => job,
+        };
+        state.job = Some(job);
+        ready.notify_one();
+    }
+
+    /// Waits for the next job. Returns `None` once the mailbox is closed.
+    pub fn take(&self) -> Option<J> {
+        let (lock, ready) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(job) = state.job.take() {
+                return Some(job);
+            }
+            state = ready.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    pub fn close(&self) {
+        let (lock, ready) = &*self.shared;
+        lock.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
+        ready.notify_all();
+    }
+}
+
 fn spawn_input(tty: Tty, messages: Sender<Msg>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut decoder = Decoder::default();
@@ -152,6 +221,29 @@ fn spawn_input(tty: Tty, messages: Sender<Msg>, stop: Arc<AtomicBool>) -> JoinHa
     })
 }
 
+/// Polls file size and modification time, which also catches editors that save by renaming.
+pub fn spawn_poller(paths: Vec<PathBuf>, messages: Sender<Msg>, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let stamps = || -> Vec<_> {
+            paths
+                .iter()
+                .map(|path| fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok())))
+                .collect()
+        };
+        let mut last = stamps();
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(POLL);
+            let now = stamps();
+            if now != last {
+                last = now;
+                if messages.send(Msg::Changed).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// What the main loop should do after an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -171,9 +263,8 @@ impl Outcome {
     }
 }
 
-/// The terminal state shared by live modes: raw input, signals, the worker and the region.
+/// The terminal state shared by live modes: raw input, signals, colors and the region.
 pub struct Session {
-    pub worker: Worker,
     pub region: Region,
     pub grid: Grid,
     setup: Setup,
@@ -199,11 +290,9 @@ impl Session {
         let resized = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGWINCH, Arc::clone(&resized))?;
         let stop_input = Arc::new(AtomicBool::new(false));
-        let input = spawn_input(tty.clone(), messages.clone(), Arc::clone(&stop_input));
-        let worker = Worker::spawn(setup.config.clone(), setup.background, messages);
+        let input = spawn_input(tty.clone(), messages, Arc::clone(&stop_input));
         write_stdout(b"\x1b[?25l\x1b[?2031h\x1b[?2048h")?;
         Ok(Session {
-            worker,
             region: Region::default(),
             grid: setup.grid,
             setup: setup.clone(),
@@ -237,15 +326,20 @@ impl Session {
         Ok(())
     }
 
-    /// Queues a render with the current configuration.
-    pub fn submit(&mut self, source: String, grid: Grid, fit: Fit) {
-        self.worker.submit(Job {
+    /// A render job at the chosen scale, carrying the new configuration after a theme change.
+    pub fn job(&mut self, source: String, grid: Grid, fit: Fit) -> Job {
+        Job {
             source,
             grid,
             scale: self.setup.scale,
             fit,
             config: self.config.take(),
-        });
+        }
+    }
+
+    /// The configuration to switch to after a theme change, handed out once.
+    pub fn take_config(&mut self) -> Option<Value> {
+        self.config.take()
     }
 
     /// Handles the input every live mode shares: quitting, resizing and color changes.
@@ -515,5 +609,15 @@ mod tests {
         assert_eq!(Outcome::Redraw.or(Outcome::Quit(0)), Outcome::Quit(0));
         assert_eq!(Outcome::Continue.or(Outcome::Redraw), Outcome::Redraw);
         assert_eq!(Outcome::Continue.or(Outcome::Continue), Outcome::Continue);
+    }
+
+    #[test]
+    fn mailboxes_keep_the_newest_job() {
+        let mailbox = Mailbox::new();
+        mailbox.put_with(1, |new, _| new);
+        mailbox.put_with(2, |new, waiting| new + waiting * 10);
+        assert_eq!(mailbox.take(), Some(12));
+        mailbox.close();
+        assert_eq!(mailbox.take(), None);
     }
 }

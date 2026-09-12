@@ -18,7 +18,7 @@ pub struct Engine {
     request: SvgRequest,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Failure {
     /// The input holds no diagram.
     Empty,

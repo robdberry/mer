@@ -55,13 +55,24 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         [path] => path.as_os_str() == "-",
         _ => false,
     };
+    let reads_stdin = cli.inputs.is_empty() || cli.inputs.iter().any(|path| path.as_os_str() == "-");
+    if (cli.watch || cli.interactive) && (cli.check || cli.output.is_some()) {
+        bail!("--watch and --interactive cannot be combined with --check or -o");
+    }
+    if cli.watch && reads_stdin {
+        bail!("--watch needs files; input from stdin is already shown as it arrives");
+    }
+    if cli.interactive {
+        let diagrams = load(cli)?;
+        let paths = cli
+            .inputs
+            .iter()
+            .filter(|path| path.as_os_str() != "-")
+            .cloned()
+            .collect();
+        return live::viewer::run(Setup::new(cli)?, diagrams, paths, cli.watch);
+    }
     if cli.watch {
-        if cli.inputs.is_empty() || cli.inputs.iter().any(|path| path.as_os_str() == "-") {
-            bail!("--watch needs files; input from stdin is already shown as it arrives");
-        }
-        if cli.check || cli.output.is_some() {
-            bail!("--watch cannot be combined with --check or -o");
-        }
         return live::watch::run(Setup::new(cli)?, cli.inputs.clone(), cli.diagram);
     }
     if cli.check {
