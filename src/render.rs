@@ -37,6 +37,11 @@ impl Renderer {
         }
     }
 
+    /// Switches to a new Mermaid configuration, keeping the rasterizer and the fonts it loaded.
+    pub fn set_config(&mut self, config: Value) {
+        self.engine = Engine::new(config, None);
+    }
+
     pub fn frame(
         &mut self,
         source: &str,

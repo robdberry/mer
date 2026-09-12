@@ -4,23 +4,23 @@
 //! the current zoom, so the picture stays sharp at any size.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use resvg::{tiny_skia, usvg};
 use serde_json::Value;
 
-use super::{Mailbox, Msg, Outcome, Session, TICK, dim, fit_line, spawn_poller, write_stdout};
+use super::{Msg, Outcome, Session, Worker, dim, fit_line, receive, spawn_poller, write_stdout};
 use crate::diag::{self, Diagnostic, NO_DIAGRAM};
 use crate::display::Setup;
-use crate::engine::{Control, Engine, Failure};
+use crate::engine::{Engine, Failure};
 use crate::input::{self, Diagram};
 use crate::raster::{self, Rasterizer};
 use crate::size::{self, Grid};
@@ -82,13 +82,9 @@ pub fn run(
         spawn_poller(paths.clone(), messages.clone(), Arc::clone(&stop));
     }
     let session = Session::start(&setup, messages.clone())?;
-    let jobs = Mailbox::new();
-    let worker = spawn_worker(setup.config.clone(), setup.background, jobs.clone(), messages);
-    write_stdout(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1016h")?;
-
     let mut viewer = Viewer {
         session,
-        jobs: jobs.clone(),
+        worker: spawn_worker(&setup, messages),
         paths,
         selected,
         diagrams,
@@ -103,6 +99,7 @@ pub fn run(
         elapsed: Duration::ZERO,
         notes: Vec::new(),
     };
+    write_stdout(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1016h")?;
     let result = viewer.run(inbox);
 
     let mut out = Vec::new();
@@ -111,33 +108,27 @@ pub fn run(
     }
     out.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l");
     let _ = write_stdout(&out);
-    jobs.close();
-    let _ = worker.join();
     stop.store(true, Ordering::Relaxed);
     result
 }
 
-fn spawn_worker(
-    config: Value,
-    background: Option<Rgb>,
-    jobs: Mailbox<Job>,
-    messages: Sender<Msg>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut engine = Engine::new(config, None);
-        let mut rasterizer = Rasterizer::new();
-        let mut layouts: HashMap<usize, Result<usvg::Tree, Failure>> = HashMap::new();
-        while let Some(job) = jobs.take() {
-            let started = Instant::now();
-            if let Some(config) = &job.config {
-                engine = Engine::new(config.clone(), None);
-                layouts.clear();
-            }
-            if job.reload {
-                layouts.clear();
-            }
-            let layout = layouts.entry(job.index).or_insert_with(|| {
-                let svg = engine.render_svg(&job.source, Control::new())?;
+/// Starts the worker that lays out each diagram once and rasterizes views of it.
+fn spawn_worker(setup: &Setup, messages: Sender<Msg>) -> Worker<Job> {
+    let mut engine = Engine::new(setup.config.clone(), None);
+    let mut rasterizer = Rasterizer::new();
+    let mut layouts: HashMap<usize, Result<usvg::Tree, Failure>> = HashMap::new();
+    let background = setup.background;
+    Worker::spawn(messages, move |job: Job, control| {
+        let started = Instant::now();
+        if let Some(config) = &job.config {
+            engine = Engine::new(config.clone(), None);
+            layouts.clear();
+        }
+        if job.reload {
+            layouts.clear();
+        }
+        if let Entry::Vacant(entry) = layouts.entry(job.index) {
+            let layout = engine.render_svg(&job.source, control).and_then(|svg| {
                 rasterizer.parse(&svg).map_err(|err| {
                     Failure::Diagnostic(Diagnostic {
                         message: format!("{err:#}"),
@@ -145,18 +136,24 @@ fn spawn_worker(
                     })
                 })
             });
-            let result = match layout {
-                Ok(tree) => Ok(shoot(tree, &job, background, started)),
-                Err(failure) => Err(failure.clone()),
-            };
-            let viewed = Viewed {
-                index: job.index,
-                result,
-            };
-            if messages.send(Msg::Viewed(Box::new(viewed))).is_err() {
-                return;
+            if matches!(layout, Err(Failure::Cancelled)) {
+                // Not a result for the diagram: the next job lays it out again.
+                let viewed = Viewed {
+                    index: job.index,
+                    result: Err(Failure::Cancelled),
+                };
+                return Msg::Viewed(Box::new(viewed));
             }
+            entry.insert(layout);
         }
+        let result = match &layouts[&job.index] {
+            Ok(tree) => Ok(shoot(tree, &job, background, started)),
+            Err(failure) => Err(failure.clone()),
+        };
+        Msg::Viewed(Box::new(Viewed {
+            index: job.index,
+            result,
+        }))
     })
 }
 
@@ -224,7 +221,7 @@ struct Drag {
 
 struct Viewer {
     session: Session,
-    jobs: Mailbox<Job>,
+    worker: Worker<Job>,
     paths: Vec<PathBuf>,
     /// The diagram of each input to show, counting from 1.
     selected: Option<usize>,
@@ -247,10 +244,8 @@ impl Viewer {
     fn run(&mut self, inbox: Receiver<Msg>) -> Result<ExitCode> {
         loop {
             self.pump()?;
-            let message = match inbox.recv_timeout(TICK) {
-                Ok(message) => Some(message),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => return Ok(ExitCode::SUCCESS),
+            let Ok(message) = receive(&inbox, self.session.deadline()) else {
+                return Ok(ExitCode::SUCCESS);
             };
             let mut outcome = self.session.tick();
             match message {
@@ -258,6 +253,7 @@ impl Viewer {
                     outcome = outcome.or(self.session.handle(&event));
                     self.input(event);
                 }
+                Some(Msg::Signal(signal)) => outcome = outcome.or(self.session.signal(signal)),
                 Some(Msg::Viewed(viewed)) => self.viewed(*viewed)?,
                 Some(Msg::Changed) => self.reload(),
                 _ => {}
@@ -311,11 +307,7 @@ impl Viewer {
             config: self.session.take_config(),
             reload: std::mem::take(&mut self.reload),
         };
-        self.jobs.put_with(job, |new, old| Job {
-            config: new.config.or(old.config),
-            reload: new.reload || old.reload,
-            ..new
-        });
+        self.worker.submit(job);
         self.busy = true;
         Ok(())
     }
@@ -464,6 +456,8 @@ impl Viewer {
     }
 
     fn select(&mut self, index: usize) {
+        // A layout still in progress is for the diagram being left.
+        self.worker.cancel();
         self.index = index;
         self.view = None;
         self.size = None;

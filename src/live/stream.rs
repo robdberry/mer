@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim};
+use super::{Job, Msg, Outcome, Picture, Session, Worker, dim, receive, renderer};
 use crate::display::{self, Setup};
 use crate::engine::Failure;
 use crate::input::markdown::{Fence, Scanner};
@@ -50,7 +50,7 @@ pub fn run(setup: Setup, format: Option<Format>) -> Result<ExitCode> {
         }
     }
 
-    let worker = Worker::spawn(setup.config.clone(), setup.background, messages.clone());
+    let worker = renderer(&setup, messages.clone());
     let session = Session::start(&setup, messages)?;
     let mut live = Live::new(setup, session, worker, format);
     live.feed(&bytes);
@@ -87,7 +87,7 @@ enum Busy {
 struct Live {
     setup: Setup,
     session: Session,
-    worker: Worker,
+    worker: Worker<Job>,
     /// The format given with `--stdin-format`, if any.
     fixed_format: Option<Format>,
     /// The format of the document being received, once known.
@@ -111,7 +111,7 @@ struct Live {
 }
 
 impl Live {
-    fn new(setup: Setup, session: Session, worker: Worker, format: Option<Format>) -> Live {
+    fn new(setup: Setup, session: Session, worker: Worker<Job>, format: Option<Format>) -> Live {
         Live {
             setup,
             session,
@@ -140,10 +140,9 @@ impl Live {
             if self.ended && self.queue.is_empty() && self.busy.is_none() {
                 break None;
             }
-            let message = match inbox.recv_timeout(TICK) {
-                Ok(message) => Some(message),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break None,
+            let deadline = self.session.deadline().into_iter().chain(self.preview_at()).min();
+            let Ok(message) = receive(&inbox, deadline) else {
+                break None;
             };
             let mut outcome = self.session.tick();
             match message {
@@ -153,6 +152,7 @@ impl Live {
                     self.ended = true;
                 }
                 Some(Msg::Input(event)) => outcome = outcome.or(self.session.handle(&event)),
+                Some(Msg::Signal(signal)) => outcome = outcome.or(self.session.signal(signal)),
                 Some(Msg::Rendered(result)) => self.rendered(result)?,
                 Some(Msg::Changed | Msg::Viewed(_)) | None => {}
             }
@@ -254,6 +254,12 @@ impl Live {
         self.scanned = 0;
         self.format = self.fixed_format;
         self.dirty = false;
+    }
+
+    /// When a preview of the Mermaid document still arriving is due, if one is waiting.
+    fn preview_at(&self) -> Option<Instant> {
+        let waiting = self.busy.is_none() && self.dirty && self.format == Some(Format::Mermaid);
+        waiting.then_some(self.last_data + QUIET)
     }
 
     /// Starts the next render when the worker is free: finished diagrams first, in order,

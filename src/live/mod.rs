@@ -1,7 +1,8 @@
 //! Live modes: output that keeps updating while the input changes.
 //!
-//! Terminal input, stdin or file changes, and a render worker each run on their own thread and
-//! feed one channel. The main loop owns all terminal output.
+//! Terminal input, signals, stdin or file changes, and a render worker each run on their own
+//! thread and feed one channel. The main loop owns all terminal output, and sleeps until a
+//! message arrives or a deadline passes.
 
 pub mod stream;
 pub mod viewer;
@@ -10,15 +11,16 @@ pub mod watch;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
+use signal_hook::iterator::{Handle, Signals};
 
 use crate::display::Setup;
 use crate::engine::{Control, Failure};
@@ -27,10 +29,8 @@ use crate::size::{Fit, Grid};
 use crate::term::input::{Decoder, Event, Key};
 use crate::term::tty::{RawMode, Tty};
 use crate::term::{self, kitty, probe};
-use crate::theme::{Palette, Rgb};
+use crate::theme::Palette;
 
-/// How often the main loop wakes up when nothing arrives.
-pub const TICK: Duration = Duration::from_millis(25);
 /// After a light/dark switch, color replies are collected this long before re-rendering.
 const RECOLOR_DELAY: Duration = Duration::from_millis(150);
 /// How often watched files are checked for changes.
@@ -38,6 +38,7 @@ const POLL: Duration = Duration::from_millis(150);
 
 pub enum Msg {
     Input(Event),
+    Signal(i32),
     Stdin(Vec<u8>),
     StdinEnd,
     Changed,
@@ -45,158 +46,98 @@ pub enum Msg {
     Viewed(Box<viewer::Viewed>),
 }
 
-pub struct Job {
-    pub source: String,
-    pub grid: Grid,
-    pub scale: f32,
-    pub fit: Fit,
-    /// A new Mermaid configuration to switch to first, after a theme change.
-    pub config: Option<Value>,
+/// Waits for the next message, until `deadline` if there is one. `Ok(None)` means the deadline
+/// passed first; `Err` means every sender is gone.
+pub fn receive(
+    inbox: &Receiver<Msg>,
+    deadline: Option<Instant>,
+) -> Result<Option<Msg>, RecvError> {
+    let Some(deadline) = deadline else {
+        return inbox.recv().map(Some);
+    };
+    match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(message) => Ok(Some(message)),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+        Err(RecvTimeoutError::Disconnected) => Err(RecvError),
+    }
 }
 
-#[derive(Default)]
-struct Slot {
-    job: Option<Job>,
+/// Runs jobs on its own thread, one at a time. The main loop waits for a job's result before
+/// submitting the next, so changes that arrive meanwhile are rendered together.
+pub struct Worker<J> {
+    jobs: Option<Sender<(J, Control)>>,
     running: Option<Control>,
-    closed: bool,
-}
-
-/// Renders on its own thread, one job at a time. A new job replaces one that hasn't started.
-pub struct Worker {
-    shared: Arc<(Mutex<Slot>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl Worker {
-    pub fn spawn(config: Value, background: Option<Rgb>, messages: Sender<Msg>) -> Worker {
-        let shared: Arc<(Mutex<Slot>, Condvar)> = Arc::default();
-        let thread = thread::spawn({
-            let shared = Arc::clone(&shared);
-            move || {
-                let mut renderer = Renderer::new(config, background);
-                let (lock, ready) = &*shared;
-                loop {
-                    let (job, control) = {
-                        let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-                        loop {
-                            if slot.closed {
-                                return;
-                            }
-                            if let Some(job) = slot.job.take() {
-                                let control = Control::new();
-                                slot.running = Some(control.clone());
-                                break (job, control);
-                            }
-                            slot = ready.wait(slot).unwrap_or_else(PoisonError::into_inner);
-                        }
-                    };
-                    if let Some(config) = job.config {
-                        renderer = Renderer::new(config, background);
-                    }
-                    let result =
-                        renderer.frame(&job.source, &job.grid, job.scale, job.fit, control);
-                    lock.lock().unwrap_or_else(PoisonError::into_inner).running = None;
-                    if messages.send(Msg::Rendered(result)).is_err() {
-                        return;
-                    }
+impl<J: Send + 'static> Worker<J> {
+    /// Starts a thread that calls `work` for each job and sends what it returns.
+    pub fn spawn(
+        messages: Sender<Msg>,
+        mut work: impl FnMut(J, Control) -> Msg + Send + 'static,
+    ) -> Worker<J> {
+        let (jobs, queue) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            for (job, control) in queue {
+                if messages.send(work(job, control)).is_err() {
+                    return;
                 }
             }
         });
         Worker {
-            shared,
+            jobs: Some(jobs),
+            running: None,
             thread: Some(thread),
         }
     }
 
-    pub fn submit(&self, mut job: Job) {
-        let (lock, ready) = &*self.shared;
-        let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(replaced) = slot.job.take() {
-            job.config = job.config.or(replaced.config);
+    pub fn submit(&mut self, job: J) {
+        let control = Control::new();
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send((job, control.clone()));
         }
-        slot.job = Some(job);
-        ready.notify_one();
+        self.running = Some(control);
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let (lock, ready) = &*self.shared;
-        {
-            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            slot.closed = true;
-            if let Some(control) = &slot.running {
-                control.cancel();
-            }
+impl<J> Worker<J> {
+    /// Stops the job in progress early. Its result is `Failure::Cancelled`.
+    pub fn cancel(&self) {
+        if let Some(control) = &self.running {
+            control.cancel();
         }
-        ready.notify_one();
+    }
+}
+
+impl<J> Drop for Worker<J> {
+    fn drop(&mut self) {
+        self.cancel();
+        self.jobs = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-/// A one-job slot between the main loop and a worker thread. A job that hasn't been taken yet
-/// is merged into the job that replaces it.
-pub struct Mailbox<J> {
-    shared: Arc<(Mutex<MailboxState<J>>, Condvar)>,
+/// A render for the stream and watch modes.
+pub struct Job {
+    pub source: String,
+    pub grid: Grid,
+    pub fit: Fit,
+    /// A new Mermaid configuration to switch to first, after a theme change.
+    pub config: Option<Value>,
 }
 
-struct MailboxState<J> {
-    job: Option<J>,
-    closed: bool,
-}
-
-impl<J> Clone for Mailbox<J> {
-    fn clone(&self) -> Self {
-        Mailbox {
-            shared: Arc::clone(&self.shared),
+/// Starts the worker that renders frames for the stream and watch modes.
+pub fn renderer(setup: &Setup, messages: Sender<Msg>) -> Worker<Job> {
+    let mut renderer = Renderer::new(setup.config.clone(), setup.background);
+    let scale = setup.scale;
+    Worker::spawn(messages, move |job: Job, control| {
+        if let Some(config) = job.config {
+            renderer.set_config(config);
         }
-    }
-}
-
-impl<J> Mailbox<J> {
-    pub fn new() -> Mailbox<J> {
-        let state = MailboxState {
-            job: None,
-            closed: false,
-        };
-        Mailbox {
-            shared: Arc::new((Mutex::new(state), Condvar::new())),
-        }
-    }
-
-    pub fn put_with(&self, job: J, merge: impl FnOnce(J, J) -> J) {
-        let (lock, ready) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let job = match state.job.take() {
-            Some(waiting) => merge(job, waiting),
-            None => job,
-        };
-        state.job = Some(job);
-        ready.notify_one();
-    }
-
-    /// Waits for the next job. Returns `None` once the mailbox is closed.
-    pub fn take(&self) -> Option<J> {
-        let (lock, ready) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if state.closed {
-                return None;
-            }
-            if let Some(job) = state.job.take() {
-                return Some(job);
-            }
-            state = ready.wait(state).unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    pub fn close(&self) {
-        let (lock, ready) = &*self.shared;
-        lock.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
-        ready.notify_all();
-    }
+        Msg::Rendered(renderer.frame(&job.source, &job.grid, scale, job.fit, control))
+    })
 }
 
 fn spawn_input(tty: Tty, messages: Sender<Msg>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -218,6 +159,20 @@ fn spawn_input(tty: Tty, messages: Sender<Msg>, stop: Arc<AtomicBool>) -> JoinHa
             }
         }
     })
+}
+
+/// Forwards the signals live modes handle to the main loop, until the handle is closed.
+fn spawn_signals(messages: Sender<Msg>) -> io::Result<Handle> {
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGWINCH])?;
+    let handle = signals.handle();
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            if messages.send(Msg::Signal(signal)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(handle)
 }
 
 /// Polls file size and modification time, which also catches editors that save by renaming.
@@ -271,8 +226,7 @@ pub struct Session {
     palette: Palette,
     recolor_at: Option<Instant>,
     config: Option<Value>,
-    quit: Arc<AtomicBool>,
-    resized: Arc<AtomicBool>,
+    signals: Handle,
     stop_input: Arc<AtomicBool>,
     input: Option<JoinHandle<()>>,
     _raw: RawMode,
@@ -282,12 +236,7 @@ impl Session {
     pub fn start(setup: &Setup, messages: Sender<Msg>) -> Result<Session> {
         let tty = setup.tty.clone().context("live output needs a terminal")?;
         let raw = tty.raw(true)?;
-        let quit = Arc::new(AtomicBool::new(false));
-        for signal in [SIGINT, SIGTERM, SIGHUP] {
-            signal_hook::flag::register(signal, Arc::clone(&quit))?;
-        }
-        let resized = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(SIGWINCH, Arc::clone(&resized))?;
+        let signals = spawn_signals(messages.clone())?;
         let stop_input = Arc::new(AtomicBool::new(false));
         let input = spawn_input(tty.clone(), messages, Arc::clone(&stop_input));
         write_stdout(b"\x1b[?25l\x1b[?2031h\x1b[?2048h")?;
@@ -299,8 +248,7 @@ impl Session {
             tty,
             recolor_at: None,
             config: None,
-            quit,
-            resized,
+            signals,
             stop_input,
             input: Some(input),
             _raw: raw,
@@ -325,12 +273,11 @@ impl Session {
         Ok(())
     }
 
-    /// A render job at the chosen scale, carrying the new configuration after a theme change.
+    /// A render job, carrying the new configuration after a theme change.
     pub fn job(&mut self, source: String, grid: Grid, fit: Fit) -> Job {
         Job {
             source,
             grid,
-            scale: self.setup.scale,
             fit,
             config: self.config.take(),
         }
@@ -368,22 +315,31 @@ impl Session {
         }
     }
 
-    /// Checks signals and timers. Call on every pass of the main loop.
-    pub fn tick(&mut self) -> Outcome {
-        if self.quit.load(Ordering::Relaxed) {
+    /// Handles a signal: SIGWINCH resizes, and the others quit.
+    pub fn signal(&mut self, signal: i32) -> Outcome {
+        if signal != SIGWINCH {
             return Outcome::Quit(130);
         }
-        if self.resized.swap(false, Ordering::Relaxed)
-            && let Ok(size) = self.tty.winsize()
-        {
-            return self.resize(size.ws_col, size.ws_row, size.ws_xpixel.into(), size.ws_ypixel.into());
-        }
+        let Ok(size) = self.tty.winsize() else {
+            return Outcome::Continue;
+        };
+        self.resize(size.ws_col, size.ws_row, size.ws_xpixel.into(), size.ws_ypixel.into())
+    }
+
+    /// Switches to the terminal's new colors once their replies have settled. Call on every
+    /// pass of the main loop.
+    pub fn tick(&mut self) -> Outcome {
         if self.recolor_at.is_some_and(|at| Instant::now() >= at) {
             self.recolor_at = None;
             self.config = Some(self.setup.config_for(&self.palette));
             return Outcome::Redraw;
         }
         Outcome::Continue
+    }
+
+    /// When `tick` next has something to do.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.recolor_at
     }
 
     fn resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) -> Outcome {
@@ -406,6 +362,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = write_stdout(b"\x1b[?2048l\x1b[?2031l\x1b[?25h");
+        self.signals.close();
         self.stop_input.store(true, Ordering::Relaxed);
         if let Some(input) = self.input.take() {
             let _ = input.join();
@@ -611,12 +568,19 @@ mod tests {
     }
 
     #[test]
-    fn mailboxes_keep_the_newest_job() {
-        let mailbox = Mailbox::new();
-        mailbox.put_with(1, |new, _| new);
-        mailbox.put_with(2, |new, waiting| new + waiting * 10);
-        assert_eq!(mailbox.take(), Some(12));
-        mailbox.close();
-        assert_eq!(mailbox.take(), None);
+    fn dropping_a_worker_cancels_its_job() {
+        let (messages, inbox) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        let mut worker = Worker::spawn(messages, move |(), control: Control| {
+            started.send(()).unwrap();
+            while !control.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Msg::Changed
+        });
+        worker.submit(());
+        running.recv().unwrap();
+        drop(worker);
+        assert!(matches!(inbox.try_recv(), Ok(Msg::Changed)));
     }
 }

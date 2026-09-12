@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Result;
 
-use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim, spawn_poller};
+use super::{Job, Msg, Outcome, Picture, Session, Worker, dim, receive, renderer, spawn_poller};
 use crate::diag::{self, NO_DIAGRAM};
 use crate::display::Setup;
 use crate::engine::Failure;
@@ -21,7 +21,7 @@ pub fn run(setup: Setup, paths: Vec<PathBuf>, selected: Option<usize>) -> Result
     let (messages, inbox) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     spawn_poller(paths.clone(), messages.clone(), Arc::clone(&stop));
-    let worker = Worker::spawn(setup.config.clone(), setup.background, messages.clone());
+    let worker = renderer(&setup, messages.clone());
     let session = Session::start(&setup, messages)?;
     let mut watch = Watch {
         session,
@@ -44,7 +44,7 @@ pub fn run(setup: Setup, paths: Vec<PathBuf>, selected: Option<usize>) -> Result
 
 struct Watch {
     session: Session,
-    worker: Worker,
+    worker: Worker<Job>,
     paths: Vec<PathBuf>,
     /// The diagram of each file to show, counting from 1.
     selected: Option<usize>,
@@ -64,10 +64,8 @@ impl Watch {
     fn run(mut self, inbox: Receiver<Msg>) -> Result<ExitCode> {
         let code = loop {
             self.pump()?;
-            let message = match inbox.recv_timeout(TICK) {
-                Ok(message) => Some(message),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break 0,
+            let Ok(message) = receive(&inbox, self.session.deadline()) else {
+                break 0;
             };
             let mut outcome = self.session.tick();
             match message {
@@ -76,6 +74,7 @@ impl Watch {
                     outcome = outcome.or(self.session.handle(&event));
                     self.key(&event);
                 }
+                Some(Msg::Signal(signal)) => outcome = outcome.or(self.session.signal(signal)),
                 Some(Msg::Rendered(result)) => self.rendered(result)?,
                 Some(Msg::Stdin(_) | Msg::StdinEnd | Msg::Viewed(_)) | None => {}
             }
