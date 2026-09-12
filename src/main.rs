@@ -7,6 +7,7 @@ mod input;
 mod live;
 mod raster;
 mod render;
+mod settings;
 mod size;
 mod term;
 mod theme;
@@ -24,6 +25,7 @@ use display::Setup;
 use engine::{Control, Engine};
 use input::{Diagram, Format};
 use raster::Rasterizer;
+use settings::Settings;
 use theme::Rgb;
 
 /// Scale for exported PNGs before `--scale`, so they are sharp on high-density displays.
@@ -50,12 +52,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Cli::command().print_help()?;
         return Ok(ExitCode::from(2));
     }
+    let settings = Settings::load(cli)?;
+    let reads_stdin =
+        cli.inputs.is_empty() || cli.inputs.iter().any(|path| path.as_os_str() == "-");
     let only_stdin = match cli.inputs.as_slice() {
         [] => true,
         [path] => path.as_os_str() == "-",
         _ => false,
     };
-    let reads_stdin = cli.inputs.is_empty() || cli.inputs.iter().any(|path| path.as_os_str() == "-");
     if (cli.watch || cli.interactive) && (cli.check || cli.output.is_some()) {
         bail!("--watch and --interactive cannot be combined with --check or -o");
     }
@@ -64,7 +68,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     }
     if cli.interactive {
         let diagrams = load(cli)?;
-        let setup = graphics_setup(cli, "--interactive")?;
+        let setup = graphics_setup(&settings, "--interactive")?;
         let paths = cli
             .inputs
             .iter()
@@ -74,29 +78,29 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         return live::viewer::run(setup, diagrams, paths, cli.watch);
     }
     if cli.watch {
-        let setup = graphics_setup(cli, "--watch")?;
+        let setup = graphics_setup(&settings, "--watch")?;
         return live::watch::run(setup, cli.inputs.clone(), cli.diagram);
     }
     if cli.check {
-        return check(cli, &load(cli)?);
+        return check(&settings, &load(cli)?);
     }
     if let Some(output) = &cli.output {
-        return export(cli, &load(cli)?, output);
+        return export(cli, &settings, &load(cli)?, output);
     }
     if only_stdin && cli.diagram.is_none() {
-        let setup = Setup::new(cli)?;
+        let setup = Setup::new(&settings)?;
         if setup.text {
             return display::show(&setup, &load(cli)?);
         }
         return live::stream::run(setup, stdin_format(cli));
     }
     let diagrams = load(cli)?;
-    display::show(&Setup::new(cli)?, &diagrams)
+    display::show(&Setup::new(&settings)?, &diagrams)
 }
 
 /// Setup for a mode that only works with images.
-fn graphics_setup(cli: &Cli, mode: &str) -> Result<Setup> {
-    let setup = Setup::new(cli)?;
+fn graphics_setup(settings: &Settings, mode: &str) -> Result<Setup> {
+    let setup = Setup::new(settings)?;
     if setup.text {
         bail!("{mode} needs a terminal with the kitty graphics protocol");
     }
@@ -158,13 +162,12 @@ fn no_diagrams() -> ExitCode {
     ExitCode::from(1)
 }
 
-fn check(cli: &Cli, diagrams: &[Diagram]) -> Result<ExitCode> {
+fn check(settings: &Settings, diagrams: &[Diagram]) -> Result<ExitCode> {
     if diagrams.is_empty() {
         return Ok(no_diagrams());
     }
-    let user = display::user_config(cli.config.as_deref())?;
-    let theme = cli.theme.as_deref().unwrap_or("default");
-    let engine = Engine::new(display::site_config(theme, None, user.as_ref()), None);
+    let theme = settings.theme.as_deref().unwrap_or("default");
+    let engine = Engine::new(display::site_config(theme, None, settings.mermaid.as_ref()), None);
     let color = io::stderr().is_terminal();
     let failures = diagrams
         .iter()
@@ -183,7 +186,7 @@ fn check(cli: &Cli, diagrams: &[Diagram]) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
-fn export(cli: &Cli, diagrams: &[Diagram], output: &Path) -> Result<ExitCode> {
+fn export(cli: &Cli, settings: &Settings, diagrams: &[Diagram], output: &Path) -> Result<ExitCode> {
     if diagrams.is_empty() {
         return Ok(no_diagrams());
     }
@@ -197,14 +200,13 @@ fn export(cli: &Cli, diagrams: &[Diagram], output: &Path) -> Result<ExitCode> {
     if to_stdout && diagrams.len() > 1 {
         bail!("{} diagrams found; pick one with -n to write to stdout", diagrams.len());
     }
-    let theme = cli.theme.as_deref().unwrap_or("default");
-    let background = display::background(cli.background.as_deref(), theme, None)?;
+    let theme = settings.theme.as_deref().unwrap_or("default");
+    let background = display::background(settings.background.as_deref(), theme, None)?;
     let svg_background = match format {
         OutputFormat::Svg => background.map(Rgb::hex),
         OutputFormat::Png => None,
     };
-    let user = display::user_config(cli.config.as_deref())?;
-    let config = display::site_config(theme, None, user.as_ref());
+    let config = display::site_config(theme, None, settings.mermaid.as_ref());
     let engine = Engine::new(config, svg_background.as_deref());
     let mut rasterizer = Rasterizer::new();
     let color = io::stderr().is_terminal();
@@ -224,7 +226,8 @@ fn export(cli: &Cli, diagrams: &[Diagram], output: &Path) -> Result<ExitCode> {
             OutputFormat::Png => {
                 let tree = rasterizer.parse(&svg)?;
                 let (w, h) = (tree.size().width(), tree.size().height());
-                let scale = (EXPORT_SCALE * cli.scale).min((EXPORT_MAX_PIXELS / (w * h)).sqrt());
+                let scale =
+                    (EXPORT_SCALE * settings.scale).min((EXPORT_MAX_PIXELS / (w * h)).sqrt());
                 let size = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
                 raster::render(&tree, scale, size, background)
                     .encode_png()

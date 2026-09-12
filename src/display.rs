@@ -1,20 +1,19 @@
 //! Drawing diagrams in the terminal: capability checks, theme, and one-shot inline output.
 
-use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::cli::{Cli, FitArg, Protocol};
+use crate::cli::{FitArg, Protocol};
 use crate::diag::{self, Diagnostic};
 use crate::engine::{Control, Engine, Failure};
 use crate::fonts;
 use crate::input::Diagram;
 use crate::render::{self, Renderer};
+use crate::settings::{self, Settings};
 use crate::size::{self, Fit, Grid};
 use crate::term::probe::{self, Caps};
 use crate::term::tty::Tty;
@@ -41,13 +40,15 @@ pub struct Setup {
 
 impl Setup {
     /// Probes the terminal and settles size, theme and background.
-    pub fn new(cli: &Cli) -> Result<Setup> {
-        let theme = cli.theme.clone().unwrap_or_else(|| "terminal".to_string());
-        let user_config = user_config(cli.config.as_deref())?;
-        let (tty, caps, text) = match cli.protocol {
+    pub fn new(settings: &Settings) -> Result<Setup> {
+        let theme = settings.theme.clone().unwrap_or_else(|| "terminal".to_string());
+        let (tty, caps, text) = match settings.protocol {
             Protocol::Text => {
                 let tty = Tty::open().ok();
-                let cols = tty.as_ref().and_then(|tty| tty.winsize().ok()).map_or(0, |size| size.ws_col);
+                let cols = tty
+                    .as_ref()
+                    .and_then(|tty| tty.winsize().ok())
+                    .map_or(0, |size| size.ws_col);
                 let caps = Caps {
                     cols,
                     ..Caps::default()
@@ -55,7 +56,7 @@ impl Setup {
                 (tty, caps, true)
             }
             Protocol::Kitty | Protocol::Auto => {
-                let forced = cli.protocol == Protocol::Kitty;
+                let forced = settings.protocol == Protocol::Kitty;
                 if !forced && !io::stdout().is_terminal() {
                     bail!(
                         "stdout is not a terminal; write an image with -o FILE, draw text with \
@@ -92,19 +93,20 @@ impl Setup {
             cell_w,
             cell_h,
         };
-        let fit = match cli.fit {
+        let fit = match settings.fit {
             FitArg::Width => Fit::Width,
             FitArg::Contain => Fit::Contain,
             FitArg::None => Fit::None,
         };
+        let user_config = settings.mermaid.clone();
         let config = site_config(&theme, Some(&caps), user_config.as_ref());
-        let background = background(cli.background.as_deref(), &theme, Some(&caps.palette))?;
+        let background = background(settings.background.as_deref(), &theme, Some(&caps.palette))?;
         Ok(Setup {
             tty,
             caps,
             grid,
             fit,
-            scale: cli.scale,
+            scale: settings.scale,
             theme,
             user_config,
             config,
@@ -215,6 +217,11 @@ pub fn doctor() -> Result<ExitCode> {
         None => "not reported",
     };
     println!("color scheme      {scheme}");
+    match settings::config_path() {
+        Some((path, _)) if path.exists() => println!("config file       {}", path.display()),
+        Some((path, _)) => println!("config file       {} (not found)", path.display()),
+        None => println!("config file       none"),
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -224,17 +231,6 @@ pub fn probe_timeout() -> Duration {
         .and_then(|value| value.parse().ok())
         .unwrap_or(500);
     Duration::from_millis(millis)
-}
-
-pub fn user_config(path: Option<&Path>) -> Result<Option<Value>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let text =
-        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let value = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not valid JSON", path.display()))?;
-    Ok(Some(value))
 }
 
 /// Mermaid site configuration: the theme, the embedded font, then the user's configuration.
@@ -255,7 +251,8 @@ pub fn site_config(theme: &str, caps: Option<&Caps>, user: Option<&Value>) -> Va
     config
 }
 
-fn merge(base: &mut Value, overlay: Value) {
+/// Merges `overlay` into `base`, recursing into objects that both have.
+pub fn merge(base: &mut Value, overlay: Value) {
     match (base, overlay) {
         (Value::Object(base), Value::Object(overlay)) => {
             for (key, value) in overlay {

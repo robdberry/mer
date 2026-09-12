@@ -82,3 +82,42 @@ pub fn write_cells(out: &mut Vec<u8>, id: u32, cols: u16, rows: u16) {
     }
     out.extend_from_slice(cells.as_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use resvg::tiny_skia::Transform;
+
+    use super::*;
+
+    /// Costs of one full-screen viewer frame on a 5K display. Run optimized:
+    /// `cargo test --release frame_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn frame_costs() {
+        let config = serde_json::json!({ "fontFamily": crate::fonts::FAMILY });
+        let source = include_str!("../tests/fixtures/flowchart.mmd");
+        let started = Instant::now();
+        let svg = Engine::new(config, None).render_svg(source, Control::new()).unwrap();
+        let laid_out = started.elapsed();
+        let tree = Rasterizer::new().parse(&svg).unwrap();
+
+        let size = (5100, 2856);
+        let started = Instant::now();
+        let pixmap = raster::render_transform(&tree, Transform::from_scale(2.6, 2.6), size, None);
+        let rgba = raster::straight_rgba(&pixmap);
+        let rasterized = started.elapsed();
+
+        let started = Instant::now();
+        let mut out = Vec::new();
+        kitty::transmit_virtual(&mut out, 1, &rgba, size, (300, 84)).unwrap();
+        let encoded = started.elapsed();
+        eprintln!(
+            "layout {laid_out:?}, rasterize {rasterized:?}, encode {encoded:?} \
+             ({} MB of pixels as {} KB)",
+            rgba.len() >> 20,
+            out.len() >> 10
+        );
+    }
+}

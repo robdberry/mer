@@ -309,8 +309,9 @@ impl Terminal {
         let mut command = Command::new(program);
         command
             .args(args)
-            .envs(env.iter().copied())
             .env("MER_PROBE_TIMEOUT_MS", "300")
+            .env("MER_CONFIG", "/dev/null")
+            .envs(env.iter().copied())
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::piped());
         match stdin {
@@ -437,9 +438,17 @@ fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, profile: Profile) -> R
 }
 
 fn run_plain(args: &[&str]) -> Run {
+    run_plain_with(args, &[])
+}
+
+/// Runs mer without a terminal. An empty configuration file stands in for the user's own
+/// unless `env` sets `MER_CONFIG`.
+fn run_plain_with(args: &[&str], env: &[(&str, &str)]) -> Run {
     let spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
     let child = Command::new(MER)
         .args(args)
+        .env("MER_CONFIG", "/dev/null")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -684,6 +693,24 @@ fn text_protocol_works_without_a_terminal() {
     assert_eq!(run.status, 0, "{}", run.stderr);
     let text = String::from_utf8_lossy(&run.output);
     assert!(text.contains("Layout") && !text.contains('\x1b'), "{text}");
+}
+
+#[test]
+fn the_configuration_file_sets_defaults() {
+    let config = scratch_file("config.toml", "protocol = \"text\"\n");
+    let path = scratch_file("configured.mmd", "flowchart LR\n  A[Parse] --> B[Layout]\n");
+    let env = [("MER_CONFIG", config.to_str().unwrap())];
+    let run = run_plain_with(&[path.to_str().unwrap()], &env);
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert!(String::from_utf8_lossy(&run.output).contains("Layout"));
+
+    let flags_win = run_plain_with(&["--protocol", "kitty", "--check", path.to_str().unwrap()], &env);
+    assert_eq!(flags_win.status, 0, "{}", flags_win.stderr);
+
+    let invalid = scratch_file("invalid.toml", "protocol = \"sixel\"\n");
+    let run = run_plain_with(&[path.to_str().unwrap()], &[("MER_CONFIG", invalid.to_str().unwrap())]);
+    assert_eq!(run.status, 2);
+    assert!(run.stderr.contains("invalid configuration"), "{}", run.stderr);
 }
 
 #[test]

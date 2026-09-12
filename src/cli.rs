@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 /// Render Mermaid diagrams as graphics in the terminal.
 #[derive(Debug, Parser)]
@@ -44,13 +45,13 @@ pub struct Cli {
     #[arg(short = 'c', long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Size relative to the terminal's text size (for -o, relative to 2x)
-    #[arg(short = 's', long, default_value_t = 1.0)]
-    pub scale: f32,
+    /// Size relative to the terminal's text size (for -o, relative to 2x) [default: 1]
+    #[arg(short = 's', long)]
+    pub scale: Option<f32>,
 
-    /// How diagrams are fitted to the terminal
-    #[arg(long, value_enum, default_value_t = FitArg::Width)]
-    pub fit: FitArg,
+    /// How diagrams are fitted to the terminal [default: width]
+    #[arg(long, value_enum)]
+    pub fit: Option<FitArg>,
 
     /// Write PNG or SVG files instead of displaying ("-" for stdout)
     #[arg(short = 'o', long, value_name = "FILE")]
@@ -60,9 +61,9 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
-    /// How diagrams are drawn
-    #[arg(long, value_enum, default_value_t = Protocol::Auto)]
-    pub protocol: Protocol,
+    /// How diagrams are drawn [default: auto]
+    #[arg(long, value_enum)]
+    pub protocol: Option<Protocol>,
 
     /// Print the detected terminal capabilities and exit
     #[arg(long)]
@@ -76,7 +77,8 @@ pub enum StdinFormat {
     Markdown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FitArg {
     Width,
     Contain,
@@ -89,7 +91,8 @@ pub enum OutputFormat {
     Svg,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// Kitty graphics when the terminal supports them, text otherwise
     Auto,
