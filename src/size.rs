@@ -1,5 +1,8 @@
 //! How big a diagram is drawn: text-matched scale, fitting, and snapping to whole cells.
 
+use clap::ValueEnum;
+use serde::Deserialize;
+
 use crate::term::kitty::MAX_CELLS;
 
 /// Terminal grid geometry, with cell sizes in device pixels.
@@ -11,7 +14,8 @@ pub struct Grid {
     pub cell_h: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Fit {
     /// Shrink to the terminal width; the height may scroll.
     Width,

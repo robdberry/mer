@@ -7,8 +7,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cli::{Cli, FitArg, Protocol};
+use crate::cli::{Cli, Protocol};
 use crate::display;
+use crate::size::Fit;
 
 /// Settings in effect: flags override the configuration file, which overrides the defaults.
 #[derive(Clone, Debug, PartialEq)]
@@ -16,7 +17,7 @@ pub struct Settings {
     pub theme: Option<String>,
     pub background: Option<String>,
     pub scale: f32,
-    pub fit: FitArg,
+    pub fit: Fit,
     pub protocol: Protocol,
     /// Mermaid configuration: the file's `[mermaid]` table with `-c` merged over it.
     pub mermaid: Option<Value>,
@@ -29,7 +30,7 @@ pub struct File {
     theme: Option<String>,
     background: Option<String>,
     scale: Option<f32>,
-    fit: Option<FitArg>,
+    fit: Option<Fit>,
     protocol: Option<Protocol>,
     mermaid: Option<toml::Table>,
 }
@@ -68,7 +69,7 @@ impl Settings {
             theme: cli.theme.clone().or(file.theme),
             background: cli.background.clone().or(file.background),
             scale,
-            fit: cli.fit.or(file.fit).unwrap_or(FitArg::Width),
+            fit: cli.fit.or(file.fit).unwrap_or(Fit::Width),
             protocol: cli.protocol.or(file.protocol).unwrap_or(Protocol::Auto),
             mermaid,
         })
@@ -119,7 +120,7 @@ mod tests {
     fn defaults_without_flags_or_file() {
         let settings = Settings::resolve(&cli(&[]), File::default(), None).unwrap();
         assert_eq!(settings.scale, 1.0);
-        assert_eq!(settings.fit, FitArg::Width);
+        assert_eq!(settings.fit, Fit::Width);
         assert_eq!(settings.protocol, Protocol::Auto);
         assert_eq!(settings.theme, None);
         assert_eq!(settings.mermaid, None);
@@ -131,7 +132,7 @@ mod tests {
         let from_file = Settings::resolve(&cli(&[]), config, None).unwrap();
         assert_eq!(from_file.theme.as_deref(), Some("dark"));
         assert_eq!(from_file.scale, 1.5);
-        assert_eq!(from_file.fit, FitArg::Contain);
+        assert_eq!(from_file.fit, Fit::Contain);
         assert_eq!(from_file.protocol, Protocol::Text);
 
         let config = file("theme = \"dark\"\nscale = 1.5\n");

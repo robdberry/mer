@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::cli::{FitArg, Protocol};
+use crate::cli::Protocol;
 use crate::diag::{self, Diagnostic};
 use crate::engine::{Control, Engine, Failure};
 use crate::fonts;
@@ -93,11 +93,6 @@ impl Setup {
             cell_w,
             cell_h,
         };
-        let fit = match settings.fit {
-            FitArg::Width => Fit::Width,
-            FitArg::Contain => Fit::Contain,
-            FitArg::None => Fit::None,
-        };
         let user_config = settings.mermaid.clone();
         let config = site_config(&theme, Some(&caps), user_config.as_ref());
         let background = background(settings.background.as_deref(), &theme, Some(&caps.palette))?;
@@ -105,7 +100,7 @@ impl Setup {
             tty,
             caps,
             grid,
-            fit,
+            fit: settings.fit,
             scale: settings.scale,
             theme,
             user_config,

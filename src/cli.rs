@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
+use crate::size::Fit;
+
 /// Render Mermaid diagrams as graphics in the terminal.
 #[derive(Debug, Parser)]
 #[command(name = "mer", version)]
@@ -51,7 +53,7 @@ pub struct Cli {
 
     /// How diagrams are fitted to the terminal [default: width]
     #[arg(long, value_enum)]
-    pub fit: Option<FitArg>,
+    pub fit: Option<Fit>,
 
     /// Write PNG or SVG files instead of displaying ("-" for stdout)
     #[arg(short = 'o', long, value_name = "FILE")]
@@ -75,14 +77,6 @@ pub enum StdinFormat {
     Auto,
     Mermaid,
     Markdown,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FitArg {
-    Width,
-    Contain,
-    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
