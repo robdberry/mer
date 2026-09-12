@@ -55,7 +55,7 @@ impl Renderer {
         })?;
         let plan = size::plan((tree.size().width(), tree.size().height()), grid, scale, fit);
         let pixels = plan.pixels(grid);
-        let rgba = raster::straight_rgba(&raster::render(&tree, plan.scale, pixels, self.background));
+        let rgba = raster::straight_rgba(raster::render(&tree, plan.scale, pixels, self.background));
         Ok(Frame {
             rgba,
             pixels,
@@ -106,7 +106,7 @@ mod tests {
         let size = (5100, 2856);
         let started = Instant::now();
         let pixmap = raster::render_transform(&tree, Transform::from_scale(2.6, 2.6), size, None);
-        let rgba = raster::straight_rgba(&pixmap);
+        let rgba = raster::straight_rgba(pixmap);
         let rasterized = started.elapsed();
 
         let started = Instant::now();

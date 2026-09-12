@@ -62,12 +62,19 @@ pub fn render_transform(
     pixmap
 }
 
-/// Pixel data as straight (non-premultiplied) RGBA, which the kitty protocol expects.
-pub fn straight_rgba(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(pixmap.data().len());
-    for pixel in pixmap.pixels() {
-        let color = pixel.demultiply();
-        rgba.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+/// Pixel data as straight (non-premultiplied) RGBA, which the kitty protocol expects. Converted
+/// in place, and only where alpha is partial: most of a frame is transparent.
+pub fn straight_rgba(pixmap: tiny_skia::Pixmap) -> Vec<u8> {
+    let mut rgba = pixmap.take();
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        let alpha = pixel[3];
+        if alpha != 0 && alpha != 255 {
+            // tiny-skia's own formula, so the result matches `PremultipliedColorU8::demultiply`.
+            let a = f64::from(alpha) / 255.0;
+            for channel in &mut pixel[..3] {
+                *channel = (f64::from(*channel) / a + 0.5) as u8;
+            }
+        }
     }
     rgba
 }
@@ -86,8 +93,7 @@ mod tests {
         let mut rasterizer = Rasterizer::new();
         let tree = rasterizer.parse(SVG).unwrap();
         assert_eq!((tree.size().width(), tree.size().height()), (40.0, 20.0));
-        let pixmap = render(&tree, 2.0, (100, 50), None);
-        let rgba = straight_rgba(&pixmap);
+        let rgba = straight_rgba(render(&tree, 2.0, (100, 50), None));
         assert_eq!(rgba.len(), 100 * 50 * 4);
         let at = |x: usize, y: usize| &rgba[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
         assert_eq!(at(10, 10)[0], 255);
@@ -104,7 +110,27 @@ mod tests {
     fn background_fills_the_frame() {
         let mut rasterizer = Rasterizer::new();
         let tree = rasterizer.parse(SVG).unwrap();
-        let rgba = straight_rgba(&render(&tree, 1.0, (60, 30), Some(Rgb(1, 2, 3))));
+        let rgba = straight_rgba(render(&tree, 1.0, (60, 30), Some(Rgb(1, 2, 3))));
         assert_eq!(&rgba[rgba.len() - 4..], [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn straight_alpha_matches_tiny_skia() {
+        // Every alpha, with channels from zero up to the alpha, as premultiplied pixels allow.
+        let mut data = Vec::new();
+        for alpha in 0..=255u8 {
+            data.extend_from_slice(&[0, alpha / 3, alpha, alpha, alpha / 2, alpha / 7, alpha / 5, alpha]);
+        }
+        let size = tiny_skia::IntSize::from_wh(2, 256).unwrap();
+        let pixmap = tiny_skia::Pixmap::from_vec(data, size).unwrap();
+        let expected: Vec<u8> = pixmap
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let color = pixel.demultiply();
+                [color.red(), color.green(), color.blue(), color.alpha()]
+            })
+            .collect();
+        assert_eq!(straight_rgba(pixmap), expected);
     }
 }

@@ -177,7 +177,7 @@ fn shoot(tree: &usvg::Tree, job: &Job, background: Option<Rgb>, started: Instant
     );
     let pixmap = raster::render_transform(tree, transform, pixels, background);
     Shot {
-        rgba: raster::straight_rgba(&pixmap),
+        rgba: raster::straight_rgba(pixmap),
         pixels,
         cells: (job.grid.cols, job.grid.rows),
         size,
