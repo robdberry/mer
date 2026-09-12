@@ -1,7 +1,7 @@
 //! End-to-end tests: `mer` runs on a pseudo-terminal that answers its capability probe the way
 //! Ghostty does, and the tests decode what it writes back into images and placeholder grids.
 //!
-//! Set `MER_E2E_DUMP=1` to write each decoded image to `target/e2e/`, composited over the fake
+//! Set `MER_E2E_DUMP=1` to write decoded images to `target/tmp/e2e/`, composited over the fake
 //! terminal's background, for inspection.
 
 use std::collections::HashMap;
@@ -10,8 +10,10 @@ use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -24,6 +26,7 @@ const ROWS: u16 = 40;
 const CELL: (u32, u32) = (17, 34);
 const BACKGROUND: [u8; 3] = [0x1e, 0x1e, 0x2e];
 const PLACEHOLDER: char = '\u{10EEEE}';
+const TRANSMIT: &[u8] = b"a=T,U=1";
 
 /// What Ghostty sends back for mer's probe.
 const GHOSTTY: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;34;17t\x1b[4;1360;2040t\
@@ -59,6 +62,22 @@ fn fixture(name: &str) -> String {
         .into_owned()
 }
 
+fn scratch_file(name: &str, contents: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("scratch");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack.windows(needle.len()).filter(|window| *window == needle).count()
+}
+
 fn open_pty() -> (OwnedFd, OwnedFd) {
     let (mut master, mut slave) = (0, 0);
     let mut size = libc::winsize {
@@ -80,59 +99,151 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
-/// Runs mer with a pseudo-terminal as its controlling terminal and stdout. The terminal sends
-/// `replies` once it sees the DA1 query that ends the probe. With `stdin`, input is piped.
-fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, replies: &'static [u8]) -> Run {
-    let (master, slave) = open_pty();
-    let mut command = Command::new(MER);
-    command
-        .args(args)
-        .env("MER_PROBE_TIMEOUT_MS", "300")
-        .stdout(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::piped());
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::from(slave.try_clone().unwrap()));
-    }
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(1, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().expect("spawn mer");
-    drop(command);
-    drop(slave);
+enum Stdin {
+    /// stdin is the terminal itself.
+    Terminal,
+    /// stdin is a pipe the test writes to.
+    Pipe,
+}
 
-    let mut master = File::from(master);
-    let mut answer = master.try_clone().unwrap();
-    let terminal = thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buf = [0u8; 1 << 16];
-        let mut answered = false;
-        while let Ok(n @ 1..) = master.read(&mut buf) {
-            output.extend_from_slice(&buf[..n]);
-            if !answered && output.windows(3).any(|w| w == b"\x1b[c") {
-                answer.write_all(replies).unwrap();
-                answered = true;
-            }
+/// `mer` running with a pseudo-terminal as its controlling terminal and stdout. The terminal
+/// sends `replies` when it sees the DA1 query that ends the capability probe.
+struct Terminal {
+    child: Child,
+    keyboard: File,
+    stdin: Option<ChildStdin>,
+    output: Arc<Mutex<Vec<u8>>>,
+    screen: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<String>>,
+}
+
+impl Terminal {
+    fn spawn(args: &[&str], stdin: Stdin, replies: &'static [u8]) -> Terminal {
+        let (master, slave) = open_pty();
+        let mut command = Command::new(MER);
+        command
+            .args(args)
+            .env("MER_PROBE_TIMEOUT_MS", "300")
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::piped());
+        match stdin {
+            Stdin::Pipe => command.stdin(Stdio::piped()),
+            Stdin::Terminal => command.stdin(Stdio::from(slave.try_clone().unwrap())),
+        };
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(1, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
-        output
-    });
-    if let Some(data) = stdin {
-        let mut pipe = child.stdin.take().unwrap();
-        thread::spawn(move || pipe.write_all(&data));
+        let mut child = command.spawn().expect("spawn mer");
+        drop(command);
+        drop(slave);
+
+        let mut master = File::from(master);
+        let mut answer = master.try_clone().unwrap();
+        let keyboard = master.try_clone().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let screen = thread::spawn({
+            let output = Arc::clone(&output);
+            move || {
+                let mut buf = [0u8; 1 << 16];
+                let mut answered = false;
+                while let Ok(n @ 1..) = master.read(&mut buf) {
+                    let mut output = output.lock().unwrap();
+                    output.extend_from_slice(&buf[..n]);
+                    if !answered && contains(&output, b"\x1b[c") {
+                        answer.write_all(replies).unwrap();
+                        answered = true;
+                    }
+                }
+            }
+        });
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        let stderr = thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr_pipe.read_to_string(&mut text);
+            text
+        });
+        Terminal {
+            stdin: child.stdin.take(),
+            child,
+            keyboard,
+            output,
+            screen: Some(screen),
+            stderr: Some(stderr),
+        }
     }
-    let mut stderr = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
-    let status = child.wait().unwrap().code().unwrap_or(-1);
-    Run {
-        status,
-        output: terminal.join().unwrap(),
-        stderr,
+
+    /// Waits until the output so far satisfies `condition`. On timeout, mer is stopped and
+    /// its stderr is reported with the end of its output.
+    fn wait_for(&mut self, what: &str, condition: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if condition(&self.output.lock().unwrap()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let exited = self.child.try_wait().unwrap();
+        let _ = self.child.kill();
+        let stderr = self.stderr.take().map(|h| h.join().unwrap()).unwrap_or_default();
+        let output = self.output.lock().unwrap();
+        let tail = String::from_utf8_lossy(&output[output.len().saturating_sub(600)..]).into_owned();
+        panic!("timed out waiting for {what} (exit: {exited:?})\nstderr: {stderr}\noutput ends with {tail:?}");
+    }
+
+    fn type_keys(&mut self, keys: &[u8]) {
+        self.keyboard.write_all(keys).unwrap();
+    }
+
+    fn write_stdin(&mut self, bytes: &[u8]) {
+        let pipe = self.stdin.as_mut().expect("stdin is a pipe");
+        pipe.write_all(bytes).unwrap();
+        pipe.flush().unwrap();
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin.take();
+    }
+
+    /// Waits for mer to exit and collects what it wrote.
+    fn finish(mut self) -> Run {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status.code().unwrap_or(-1);
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!("mer did not exit");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        self.stdin.take();
+        let stderr = self.stderr.take().unwrap().join().unwrap();
+        self.screen.take().unwrap().join().unwrap();
+        let output = std::mem::take(&mut *self.output.lock().unwrap());
+        Run {
+            status,
+            output,
+            stderr,
+        }
+    }
+}
+
+/// Runs mer to completion on a terminal, with `stdin` piped in when given.
+fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, replies: &'static [u8]) -> Run {
+    match stdin {
+        Some(data) => {
+            let mut terminal = Terminal::spawn(args, Stdin::Pipe, replies);
+            terminal.write_stdin(&data);
+            terminal.close_stdin();
+            terminal.finish()
+        }
+        None => Terminal::spawn(args, Stdin::Terminal, replies).finish(),
     }
 }
 
@@ -170,8 +281,8 @@ fn images(output: &[u8]) -> Vec<Image> {
             .filter_map(|kv| kv.split_once('='))
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        if pending.is_none() && keys.get("a").is_some_and(|a| a == "q") {
-            // The capability probe's query, written to the same terminal.
+        if pending.is_none() && keys.get("a").is_some_and(|a| a == "q" || a == "d") {
+            // The capability probe's query, or a deletion.
             continue;
         }
         let more = keys.get("m").is_some_and(|m| m == "1");
@@ -401,4 +512,92 @@ fn exports_png_and_svg() {
     let run = run_plain(&[&fixture("flowchart.mmd"), "-o", "-", "--format", "svg"]);
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(run.output.starts_with(b"<svg"));
+}
+
+#[test]
+fn slow_streams_go_live_and_end_like_one_shot_output() {
+    let source = fs::read_to_string(fixture("flowchart.mmd")).unwrap();
+    let cut = source.find("    P --> L").expect("a line to cut at");
+    let mut terminal = Terminal::spawn(&["-"], Stdin::Pipe, GHOSTTY);
+    terminal.write_stdin(&source.as_bytes()[..cut]);
+    terminal.wait_for("a live preview", |out| contains(out, TRANSMIT));
+    terminal.wait_for("the status line", |out| contains(out, b"q to stop"));
+    terminal.write_stdin(&source.as_bytes()[cut..]);
+    terminal.close_stdin();
+    let live = terminal.finish();
+    assert_eq!(live.status, 0, "stderr: {}", live.stderr);
+    assert!(contains(&live.output, b"\x1b[?25h"), "the cursor is shown again");
+
+    let one_shot = run_in_terminal(&[&fixture("flowchart.mmd")], None, GHOSTTY);
+    let live_images = images(&live.output);
+    let final_image = live_images.last().expect("final image");
+    let expected = &images(&one_shot.output)[0];
+    assert!(live_images.len() >= 2, "a preview, then the final image");
+    assert_eq!(final_image.size, expected.size);
+    assert!(final_image.rgba == expected.rgba, "the final image matches one-shot output");
+}
+
+#[test]
+fn quitting_a_stream_leaves_the_terminal_usable() {
+    let mut terminal = Terminal::spawn(&["-"], Stdin::Pipe, GHOSTTY);
+    terminal.write_stdin(b"flowchart LR\n  A --> B\n");
+    terminal.wait_for("a live preview", |out| contains(out, TRANSMIT));
+    terminal.type_keys(b"q");
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    for restore in [&b"\x1b[?25h"[..], b"\x1b[?2048l", b"\x1b[?2031l"] {
+        assert!(contains(&run.output, restore), "{:?} restored", String::from_utf8_lossy(restore));
+    }
+}
+
+#[test]
+fn markdown_streams_print_each_diagram_as_its_fence_closes() {
+    let doc = fs::read_to_string(fixture("doc.md")).unwrap();
+    let split = doc.find("## States").unwrap();
+    let mut terminal = Terminal::spawn(&["-"], Stdin::Pipe, GHOSTTY);
+    terminal.write_stdin(&doc.as_bytes()[..split]);
+    terminal.wait_for("the first diagram", |out| contains(out, TRANSMIT));
+    terminal.write_stdin(&doc.as_bytes()[split..]);
+    terminal.close_stdin();
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert_eq!(images(&run.output).len(), 2);
+    assert!(String::from_utf8_lossy(&run.output).contains("States"));
+}
+
+#[test]
+fn stream_errors_are_reported_when_the_input_ends() {
+    let mut terminal = Terminal::spawn(&["-"], Stdin::Pipe, GHOSTTY);
+    terminal.write_stdin(b"flowchart TD\n  A[Start] --> B{Choice}\n");
+    terminal.wait_for("a live preview", |out| contains(out, TRANSMIT));
+    terminal.write_stdin(b"  B -->|yes| C[Done\n");
+    terminal.close_stdin();
+    let run = terminal.finish();
+    assert_eq!(run.status, 1);
+    assert!(run.stderr.contains("<stdin>:3:15"), "{}", run.stderr);
+}
+
+#[test]
+fn watch_redraws_when_the_file_changes() {
+    let path = scratch_file("watched.mmd", "flowchart LR\n  A --> B\n");
+    let mut terminal =
+        Terminal::spawn(&["-w", path.to_str().unwrap()], Stdin::Terminal, GHOSTTY);
+    terminal.wait_for("the first frame", |out| count(out, TRANSMIT) >= 1);
+    fs::write(&path, "flowchart LR\n  A --> B --> C --> D --> E\n").unwrap();
+    terminal.wait_for("a second frame", |out| count(out, TRANSMIT) >= 2);
+    fs::write(&path, "flowchart LR\n  A --> B[\n").unwrap();
+    terminal.wait_for("the error", |out| contains(out, b"watched.mmd:2:"));
+    terminal.type_keys(b"q");
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    let images = images(&run.output);
+    assert!(images.len() >= 2);
+    assert!(images[1].size.0 > images[0].size.0, "the longer chain is wider");
+}
+
+#[test]
+fn watch_rejects_stdin() {
+    let run = run_plain(&["-w", "-"]);
+    assert_eq!(run.status, 2);
+    assert!(run.stderr.contains("--watch needs files"), "{}", run.stderr);
 }

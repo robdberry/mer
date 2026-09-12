@@ -5,10 +5,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::event::{FdSetElement, Timespec, fd_set_insert, fd_set_num_elements, select};
 use rustix::termios::{
     self, InputModes, LocalModes, OptionalActions, SpecialCodeIndex, Termios, Winsize,
 };
@@ -53,12 +54,17 @@ impl Tty {
     /// Waits up to `timeout` for input and reads what is there. Returns `None` on timeout and
     /// `Some(0)` at end of file.
     pub fn read_timeout(&self, buf: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
+        // `select` rather than `poll`: on macOS, `poll` reports terminal devices as ready
+        // (POLLNVAL) without data, and the read that follows blocks.
+        let fd = self.file.as_raw_fd();
+        let mut readable = vec![FdSetElement::default(); fd_set_num_elements(1, fd + 1)];
+        fd_set_insert(&mut readable, fd);
         let timeout = Timespec {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,
         };
-        let mut fds = [PollFd::new(&*self.file, PollFlags::IN)];
-        match poll(&mut fds, Some(&timeout)) {
+        // SAFETY: the only fd in the set belongs to `self.file`, which is open for this call.
+        match unsafe { select(fd + 1, Some(&mut readable), None, None, Some(&timeout)) } {
             Ok(0) | Err(rustix::io::Errno::INTR) => return Ok(None),
             Ok(_) => {}
             Err(err) => return Err(err.into()),

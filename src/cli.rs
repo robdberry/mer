@@ -6,9 +6,14 @@ use clap::{Parser, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(name = "mer", version)]
 pub struct Cli {
-    /// Mermaid (.mmd, .mermaid) or Markdown files; "-" reads stdin
+    /// Mermaid (.mmd, .mermaid) or Markdown files; "-" reads stdin, showing input that keeps
+    /// arriving as it comes
     #[arg(value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
+
+    /// Keep running and redraw whenever an input file changes
+    #[arg(short = 'w', long)]
+    pub watch: bool,
 
     /// Parse and lay out every diagram without displaying; exit 1 on errors
     #[arg(long)]
@@ -21,10 +26,6 @@ pub struct Cli {
     /// How to interpret stdin
     #[arg(long, value_enum, default_value_t = StdinFormat::Auto)]
     pub stdin_format: StdinFormat,
-
-    /// Keep every NUL-separated document from stdin instead of only the last
-    #[arg(long)]
-    pub append: bool,
 
     /// Theme: terminal (match the terminal's colors), or a Mermaid theme such as default,
     /// dark, forest, neutral, base, neo, neo-dark
