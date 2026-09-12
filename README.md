@@ -148,6 +148,7 @@ flowchart.curve = "basis"
 - Inside tmux, pointer positions arrive in whole cells rather than pixels, so dragging and
   zooming with the mouse in the viewer are slightly coarser.
 - merman is pre-1.0. Its output is very close to mermaid.js, but not identical.
+- Very large diagrams take longer to draw: an ER schema of 250 tables takes about a second.
 
 ## Development
 

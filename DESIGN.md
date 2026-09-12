@@ -559,6 +559,10 @@ Where the implementation departs from the proposal above, and why.
 - A drawing wider than the terminal is an error. Wrapped lines garble it, and merman's fallback for drawings that don't fit lists its internal model instead. Output to a pipe or file has no width limit.
 - Live modes and the viewer need images.
 
+**Large diagrams.**
+- merman's default resource profile is meant for untrusted input, and a schema of 200 tables exceeds its layout budget. mer uses merman's profile for trusted input, which keeps its hard limits.
+- merman converts HTML labels to SVG text for resvg within a fixed CSS matching budget of about a thousand labels, so an ER diagram of 30 tables fails. A postprocessor gives merman's converter 256 labels at a time, in a document with only their ancestors and the stylesheets, and merges the text back. The result is the SVG merman would produce; a unit test compares every gallery diagram.
+
 **tmux.**
 - Graphics sequences are wrapped for passthrough.
 - Image ids are limited to 8 bits and encoded as palette colors, which tmux keeps intact.

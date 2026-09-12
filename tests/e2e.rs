@@ -630,6 +630,29 @@ fn renders_a_file_inline() {
 }
 
 #[test]
+fn large_schemas_render_inline() {
+    // More labels than merman converts for resvg in one pass.
+    let mut source = String::from("erDiagram\n");
+    for table in 0..50 {
+        source.push_str(&format!("  TABLE_{table} {{\n    int id PK\n"));
+        for column in 0..7 {
+            source.push_str(&format!("    string column_{column}\n"));
+        }
+        source.push_str("  }\n");
+        if table > 0 {
+            source.push_str(&format!("  TABLE_{} ||--o{{ TABLE_{table} : has\n", table / 2));
+        }
+    }
+    let path = scratch_file("schema.mmd", &source);
+    let run = run_in_terminal(&[path.to_str().unwrap()], None, GHOSTTY);
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    let images = images(&run.output);
+    assert_eq!(images.len(), 1);
+    assert!(visible_pixels(&images[0]) > 5_000);
+    dump("schema", &images[0]);
+}
+
+#[test]
 fn stdin_renders_exactly_like_the_file() {
     let source = fs::read(fixture("sequence.mmd")).unwrap();
     let piped = run_in_terminal(&["-"], Some(source), GHOSTTY);

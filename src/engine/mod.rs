@@ -1,9 +1,13 @@
 //! The Mermaid engine. merman is used only in this module, behind a small interface.
 
+mod labels;
 mod measure;
 
-use merman::ascii::{AsciiError, AsciiRenderOptions, AsciiViewportPolicy, OverflowPolicy};
-use merman::svg::{RootBackgroundPostprocessor, SvgPipeline};
+use merman::ascii::{
+    AsciiError, AsciiRenderOptions, AsciiResourcePolicy, AsciiViewportPolicy, OverflowPolicy,
+};
+use merman::resources::{InputResourcePolicy, ResourceProfile};
+use merman::svg::{RenderResourcePolicy, RootBackgroundPostprocessor, SvgPipeline};
 use merman::{
     AsciiRequest, MermaidConfig, ParseOptions, RenderError, RenderOutput, RenderRequest, Renderer,
     SvgEnvironment, SvgRequest,
@@ -31,17 +35,34 @@ impl Engine {
     /// `config` is Mermaid site configuration; frontmatter and directives inside a diagram
     /// override it. `background` paints the SVG root; without one the root is transparent.
     pub fn new(config: Value, background: Option<&str>) -> Engine {
+        Engine::with_label_batches(config, background, Some(labels::BATCH))
+    }
+
+    /// Like `new`, with HTML labels converted to SVG text `batch` labels at a time, or all at
+    /// once by merman without a batch size.
+    fn with_label_batches(config: Value, background: Option<&str>, batch: Option<usize>) -> Engine {
         let engine = merman::Engine::new().with_site_config(MermaidConfig::from_value(config));
+        // merman's default budgets are meant for untrusted input and reject large diagrams, such
+        // as schemas with a few hundred tables. mer draws the user's own files, and merman's hard
+        // limits still apply.
         let renderer = Renderer::new()
             .with_engine(engine)
-            .with_parse_options(ParseOptions::strict());
+            .with_parse_options(ParseOptions::strict())
+            .with_resource_policy(InputResourcePolicy::for_profile(
+                ResourceProfile::UnboundedForTrustedInput,
+            ));
+        let mut pipeline = SvgPipeline::resvg_safe();
+        if let Some(size) = batch {
+            pipeline = pipeline.with_postprocessor(labels::Batched::new(size));
+        }
         // Mermaid gives the root a white background, which would cover the terminal's.
-        let pipeline = SvgPipeline::resvg_safe().with_postprocessor(
-            RootBackgroundPostprocessor::new(background.unwrap_or("transparent")),
-        );
+        let pipeline = pipeline.with_postprocessor(RootBackgroundPostprocessor::new(
+            background.unwrap_or("transparent"),
+        ));
         let request = SvgRequest {
             environment: SvgEnvironment::deterministic()
-                .with_text_measurement_policy(measure::policy()),
+                .with_text_measurement_policy(measure::policy())
+                .with_resource_policy(RenderResourcePolicy::unbounded_for_trusted_input()),
             pipeline: Some(pipeline),
             ..SvgRequest::default()
         };
@@ -68,8 +89,8 @@ impl Engine {
         };
         let request = AsciiRequest {
             options: AsciiRenderOptions::unicode(),
+            resources: AsciiResourcePolicy::unbounded(),
             viewport,
-            ..AsciiRequest::default()
         };
         match self.renderer.render(RenderRequest::ascii(source, Control::new(), request)) {
             Ok(RenderOutput::Ascii(Some(output))) => Ok(output.text),
@@ -136,6 +157,46 @@ mod tests {
         assert!(svg.contains("Start") && svg.contains("Done"));
         assert!(!svg.contains("foreignObject"));
         assert!(!svg.contains("background-color:white"));
+    }
+
+    #[test]
+    fn label_batches_draw_what_merman_draws() {
+        let config = crate::display::site_config("default", None, None);
+        let whole = Engine::with_label_batches(config.clone(), None, None);
+        let batched = Engine::with_label_batches(config, None, Some(2));
+        let gallery = include_str!("../../tests/fixtures/gallery.md");
+        let diagrams =
+            crate::input::diagrams(gallery, "gallery.md", Some(crate::input::Format::Markdown));
+        assert!(diagrams.len() >= 20);
+        for diagram in &diagrams {
+            let expected = whole.render_svg(&diagram.text, Control::new()).ok();
+            let actual = batched.render_svg(&diagram.text, Control::new()).ok();
+            assert!(expected.is_some(), "{:?} does not render", diagram.caption);
+            assert!(expected == actual, "{:?} differs when drawn in batches", diagram.caption);
+        }
+    }
+
+    #[test]
+    fn large_schemas_render() {
+        // More layout work than merman's default budget allows, and more labels than its label
+        // conversion handles in one pass.
+        let mut source = String::from("erDiagram\n");
+        for table in 0..250 {
+            source.push_str(&format!("  TABLE_{table} {{\n"));
+            for column in 0..8 {
+                source.push_str(&format!("    string column_{column}\n"));
+            }
+            source.push_str("  }\n");
+            if table > 0 {
+                source.push_str(&format!("  TABLE_{} ||--o{{ TABLE_{table} : has\n", table / 2));
+            }
+        }
+        for link in 0..125 {
+            let (a, b) = (link * 7 % 250, (link * 13 + 5) % 250);
+            source.push_str(&format!("  TABLE_{a} }}o--o{{ TABLE_{b} : links\n"));
+        }
+        let svg = engine().render_svg(&source, Control::new()).unwrap();
+        assert!(svg.contains(">TABLE_249</text>") && !svg.contains("<foreignObject"));
     }
 
     #[test]
