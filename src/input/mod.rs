@@ -3,7 +3,14 @@
 pub mod markdown;
 pub mod sniff;
 
-use std::path::Path;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+
+/// The origin of diagrams read from stdin.
+pub const STDIN: &str = "<stdin>";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -57,8 +64,50 @@ pub fn diagrams(text: &str, origin: &str, format: Option<Format>) -> Vec<Diagram
 pub fn documents(text: &str, format: Option<Format>) -> Vec<Diagram> {
     text.split('\0')
         .filter(|document| !document.trim().is_empty())
-        .flat_map(|document| diagrams(document, "<stdin>", format))
+        .flat_map(|document| diagrams(document, STDIN, format))
         .collect()
+}
+
+/// Reads every input to the end: files by their extension, and stdin for `-`. With `selected`,
+/// only that diagram of each input is kept, counting from 1.
+pub fn read(
+    inputs: &[PathBuf],
+    stdin_format: Option<Format>,
+    selected: Option<usize>,
+) -> Result<Vec<Diagram>> {
+    let mut all = Vec::new();
+    let mut read_stdin = false;
+    for path in inputs {
+        let (origin, found) = if path.as_os_str() == "-" {
+            if std::mem::replace(&mut read_stdin, true) {
+                bail!("stdin can only be read once");
+            }
+            let mut bytes = Vec::new();
+            io::stdin()
+                .lock()
+                .read_to_end(&mut bytes)
+                .context("cannot read stdin")?;
+            let text = String::from_utf8_lossy(&bytes);
+            (STDIN.to_string(), documents(&text, stdin_format))
+        } else {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            let origin = path.display().to_string();
+            let found = diagrams(&text, &origin, format_from_extension(path));
+            (origin, found)
+        };
+        match selected {
+            None => all.extend(found),
+            Some(n) => {
+                let count = found.len();
+                let diagram = found.into_iter().nth(n.saturating_sub(1));
+                all.push(diagram.with_context(|| {
+                    format!("{origin} has {count} diagram(s), so there is no diagram {n}")
+                })?);
+            }
+        }
+    }
+    Ok(all)
 }
 
 #[cfg(test)]
@@ -99,5 +148,17 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].first_line, 0);
         assert!(diagrams("\n\n", "<stdin>", None).is_empty());
+    }
+
+    #[test]
+    fn selecting_keeps_that_diagram_of_each_input() {
+        let doc = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/doc.md"));
+        let inputs = [doc.clone(), doc];
+        assert_eq!(read(&inputs[..1], None, None).unwrap().len(), 2);
+        let selected = read(&inputs, None, Some(2)).unwrap();
+        let captions: Vec<_> = selected.iter().map(|d| d.caption.as_deref()).collect();
+        assert_eq!(captions, [Some("States"), Some("States")]);
+        let missing = read(&inputs[..1], None, Some(3)).unwrap_err().to_string();
+        assert!(missing.ends_with("has 2 diagram(s), so there is no diagram 3"), "{missing}");
     }
 }

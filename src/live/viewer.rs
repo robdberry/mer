@@ -4,7 +4,6 @@
 //! the current zoom, so the picture stays sharp at any size.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,11 +67,13 @@ struct Job {
     reload: bool,
 }
 
-/// Shows `diagrams`. `paths` are read again on `r`, and whenever they change with `watch`.
+/// Shows `diagrams`. `paths` are read again on `r`, and whenever they change with `watch`,
+/// keeping only the `selected` diagram of each.
 pub fn run(
     setup: Setup,
     diagrams: Vec<Diagram>,
     paths: Vec<PathBuf>,
+    selected: Option<usize>,
     watch: bool,
 ) -> Result<ExitCode> {
     let (messages, inbox) = mpsc::channel();
@@ -89,6 +90,7 @@ pub fn run(
         session,
         jobs: jobs.clone(),
         paths,
+        selected,
         diagrams,
         index: 0,
         view: None,
@@ -224,6 +226,8 @@ struct Viewer {
     session: Session,
     jobs: Mailbox<Job>,
     paths: Vec<PathBuf>,
+    /// The diagram of each input to show, counting from 1.
+    selected: Option<usize>,
     diagrams: Vec<Diagram>,
     index: usize,
     view: Option<View>,
@@ -467,18 +471,13 @@ impl Viewer {
     }
 
     fn reload(&mut self) {
-        let mut diagrams = Vec::new();
-        for path in &self.paths {
-            let Ok(text) = fs::read_to_string(path) else {
-                // Often a save in progress; the next change reloads.
-                return;
-            };
-            let format = input::format_from_extension(path);
-            diagrams.extend(input::diagrams(&text, &path.display().to_string(), format));
-        }
         if self.paths.is_empty() {
             return;
         }
+        // A file that can't be read is often a save in progress; the next change reloads.
+        let Ok(diagrams) = input::read(&self.paths, None, self.selected) else {
+            return;
+        };
         self.diagrams = diagrams;
         self.index = self.index.min(self.diagrams.len().saturating_sub(1));
         self.reload = true;

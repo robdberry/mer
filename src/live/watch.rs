@@ -1,6 +1,5 @@
 //! `mer -w FILE…`: the diagram is drawn again whenever a file changes.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,8 +27,9 @@ pub fn run(setup: Setup, paths: Vec<PathBuf>, selected: Option<usize>) -> Result
         session,
         worker,
         paths,
+        selected,
         diagrams: Vec::new(),
-        index: selected.map_or(0, |n| n.saturating_sub(1)),
+        index: 0,
         busy: false,
         stale: true,
         notes: Vec::new(),
@@ -46,6 +46,8 @@ struct Watch {
     session: Session,
     worker: Worker,
     paths: Vec<PathBuf>,
+    /// The diagram of each file to show, counting from 1.
+    selected: Option<usize>,
     diagrams: Vec<Diagram>,
     index: usize,
     busy: bool,
@@ -54,7 +56,7 @@ struct Watch {
     /// Lines under the diagram: the latest error.
     notes: Vec<String>,
     status: String,
-    /// A file that could not be read.
+    /// Why the files could not be read.
     problem: Option<String>,
 }
 
@@ -89,25 +91,15 @@ impl Watch {
     }
 
     fn reload(&mut self) {
-        let mut diagrams = Vec::new();
-        for path in &self.paths {
-            match fs::read_to_string(path) {
-                Ok(text) => {
-                    let origin = path.display().to_string();
-                    let format = input::format_from_extension(path);
-                    diagrams.extend(input::diagrams(&text, &origin, format));
-                }
-                Err(err) => {
-                    // Often a save in progress; the next change reloads.
-                    self.problem = Some(format!("cannot read {}: {err}", path.display()));
-                    self.stale = true;
-                    return;
-                }
+        match input::read(&self.paths, None, self.selected) {
+            Ok(diagrams) => {
+                self.problem = None;
+                self.diagrams = diagrams;
+                self.index = self.index.min(self.diagrams.len().saturating_sub(1));
             }
+            // Often a save in progress; the next change reloads.
+            Err(err) => self.problem = Some(format!("{err:#}")),
         }
-        self.problem = None;
-        self.diagrams = diagrams;
-        self.index = self.index.min(self.diagrams.len().saturating_sub(1));
         self.stale = true;
     }
 

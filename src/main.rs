@@ -13,7 +13,7 @@ mod term;
 mod theme;
 
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -75,7 +75,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             .filter(|path| path.as_os_str() != "-")
             .cloned()
             .collect();
-        return live::viewer::run(setup, diagrams, paths, cli.watch);
+        return live::viewer::run(setup, diagrams, paths, cli.diagram, cli.watch);
     }
     if cli.watch {
         let setup = graphics_setup(&settings, "--watch")?;
@@ -115,46 +115,11 @@ fn stdin_format(cli: &Cli) -> Option<Format> {
     }
 }
 
-/// Reads every input to the end.
+/// Reads every input to the end, or stdin without inputs.
 fn load(cli: &Cli) -> Result<Vec<Diagram>> {
-    let inputs = if cli.inputs.is_empty() {
-        vec![PathBuf::from("-")]
-    } else {
-        cli.inputs.clone()
-    };
-    let mut diagrams = Vec::new();
-    let mut read_stdin = false;
-    for path in &inputs {
-        let (origin, found) = if path.as_os_str() == "-" {
-            if std::mem::replace(&mut read_stdin, true) {
-                bail!("stdin can only be read once");
-            }
-            let mut bytes = Vec::new();
-            io::stdin()
-                .lock()
-                .read_to_end(&mut bytes)
-                .context("cannot read stdin")?;
-            let text = String::from_utf8_lossy(&bytes);
-            ("<stdin>".to_string(), input::documents(&text, stdin_format(cli)))
-        } else {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            let origin = path.display().to_string();
-            let found = input::diagrams(&text, &origin, input::format_from_extension(path));
-            (origin, found)
-        };
-        match cli.diagram {
-            None => diagrams.extend(found),
-            Some(n) => {
-                let count = found.len();
-                let selected = found.into_iter().nth(n.saturating_sub(1));
-                diagrams.push(selected.with_context(|| {
-                    format!("{origin} has {count} diagram(s), so there is no diagram {n}")
-                })?);
-            }
-        }
-    }
-    Ok(diagrams)
+    let stdin = [PathBuf::from("-")];
+    let inputs = if cli.inputs.is_empty() { &stdin[..] } else { &cli.inputs[..] };
+    input::read(inputs, stdin_format(cli), cli.diagram)
 }
 
 fn check(settings: &Settings, diagrams: &[Diagram]) -> Result<ExitCode> {

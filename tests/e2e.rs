@@ -909,6 +909,19 @@ fn viewer_moves_between_diagrams() {
     assert!(images(&run.output).len() >= 2);
 }
 
+#[test]
+fn viewer_reloads_keep_the_selected_diagram() {
+    let mut terminal =
+        Terminal::spawn(&["-i", &fixture("doc.md"), "-n", "2"], Stdin::Terminal, GHOSTTY);
+    terminal.wait_for("the second diagram", |out| contains(out, "› States".as_bytes()));
+    terminal.type_keys(b"r");
+    terminal.wait_for("the reloaded diagram", |out| count(out, TRANSMIT) >= 2);
+    terminal.type_keys(b"q");
+    let run = terminal.finish();
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert!(!contains(&run.output, b"Request flow"), "reloading showed the first diagram");
+}
+
 /// A private tmux server on its own socket, stopped and its socket removed when dropped.
 struct TmuxServer(PathBuf);
 

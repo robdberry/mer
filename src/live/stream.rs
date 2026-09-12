@@ -13,7 +13,7 @@ use super::{Msg, Outcome, Picture, Session, TICK, Worker, dim};
 use crate::display::{self, Setup};
 use crate::engine::Failure;
 use crate::input::markdown::{Fence, Scanner};
-use crate::input::{self, Diagram, Format, sniff};
+use crate::input::{self, Diagram, Format, STDIN, sniff};
 use crate::render::{self, Frame};
 use crate::size::{Fit, Grid};
 use crate::term::kitty;
@@ -22,8 +22,6 @@ use crate::term::kitty;
 const QUIET: Duration = Duration::from_millis(80);
 /// Without the end of input by then, output goes live.
 const LIVE_AFTER: Duration = Duration::from_millis(400);
-
-const STDIN: &str = "<stdin>";
 
 pub fn run(setup: Setup, format: Option<Format>) -> Result<ExitCode> {
     let (messages, inbox) = mpsc::channel();
