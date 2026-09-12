@@ -869,12 +869,14 @@ fn viewer_moves_between_diagrams() {
     assert!(images(&run.output).len() >= 2);
 }
 
-/// Stops a private tmux server when dropped.
-struct TmuxServer(String);
+/// A private tmux server on its own socket, stopped and its socket removed when dropped.
+struct TmuxServer(PathBuf);
 
 impl Drop for TmuxServer {
     fn drop(&mut self) {
-        let _ = Command::new("tmux").args(["-L", &self.0, "kill-server"]).output();
+        let socket = self.0.to_string_lossy().into_owned();
+        let _ = Command::new("tmux").args(["-S", &socket, "kill-server"]).output();
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -884,8 +886,9 @@ fn images_pass_through_tmux() {
         eprintln!("tmux is not installed; skipping");
         return;
     }
-    let server = TmuxServer(format!("mer-e2e-{}", std::process::id()));
     let config = scratch_file("tmux.conf", "set -g allow-passthrough on\nset -g status off\n");
+    let server = TmuxServer(config.with_file_name(format!("tmux-{}.sock", std::process::id())));
+    let socket = server.0.to_string_lossy().into_owned();
     let exit_file = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("scratch/tmux-exit");
     let _ = fs::remove_file(&exit_file);
     let command = format!(
@@ -894,8 +897,8 @@ fn images_pass_through_tmux() {
         exit_file.display()
     );
     let args = [
-        "-L",
-        &server.0,
+        "-S",
+        &socket,
         "-f",
         config.to_str().unwrap(),
         "new-session",

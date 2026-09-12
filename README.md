@@ -13,12 +13,13 @@ mer -i big.mmd            # full-screen viewer to pan and zoom
 There is no browser or Node.js involved. Diagrams are laid out by
 [merman](https://github.com/Latias94/merman), a Rust implementation of Mermaid, drawn with
 [resvg](https://github.com/linebender/resvg) using the embedded Inter font, and shown through the
-kitty graphics protocol.
+kitty graphics protocol. A typical diagram is on screen about 20 ms after you press Enter.
 
 ## Requirements
 
-- A terminal that supports the kitty graphics protocol with Unicode placeholders.
-  [Ghostty](https://ghostty.org) is the primary target; kitty also works.
+- A terminal with the kitty graphics protocol and its Unicode placeholders for images.
+  [Ghostty](https://ghostty.org) is the primary target; kitty also works. Other terminals get
+  diagrams drawn with box-drawing characters instead.
 - Rust 1.95 or newer to build. `rust-toolchain.toml` pins the version rustup installs.
 
 Check what `mer` detects in your terminal:
@@ -95,6 +96,22 @@ available with `-t`: `default`, `dark`, `forest`, `neutral`, `base`, `neo` and `
 Mermaid configuration file in JSON. Settings inside a diagram, in frontmatter or `%%{init}%%`
 directives, take precedence over both.
 
+### Without graphics
+
+In terminals without the kitty graphics protocol, `mer` draws diagrams with box-drawing
+characters and says so on stderr. `--protocol text` does the same on purpose, including when
+output goes to a pipe or a CI log. Text renderings exist for flowcharts, sequence, class and ER
+diagrams, gantt charts, journeys, git graphs, mindmaps, timelines, XY charts, packet and kanban
+diagrams, and for state diagrams with simple layouts. For other types, write an image with `-o`.
+
+### tmux
+
+Images work inside tmux 3.3 or newer once passthrough is allowed:
+
+```tmux
+set -g allow-passthrough on
+```
+
 ### Export and checks
 
 ```sh
@@ -105,10 +122,29 @@ mer --check docs/*.md             # report syntax errors; exits 1 if any
 
 Exports use Mermaid's `default` theme on white unless `-t` or `-b` say otherwise.
 
+## Configuration
+
+Defaults can be set in `~/.config/mer/config.toml`, or `$XDG_CONFIG_HOME/mer/config.toml`, or a
+file named by `MER_CONFIG`. Flags override it.
+
+```toml
+theme = "terminal"
+background = "transparent"
+scale = 1.2
+fit = "width"          # width, contain or none
+protocol = "auto"      # auto, kitty or text
+
+[mermaid]              # Mermaid configuration; -c merges over it
+flowchart.curve = "basis"
+```
+
+`mer --doctor` shows which configuration file is in use.
+
 ## Limitations
 
-- Terminals without the kitty graphics protocol aren't supported yet, and neither is tmux.
 - C4 diagrams use Mermaid's fixed C4 colors, which are hard to read on dark backgrounds.
+- Inside tmux, pointer positions arrive in whole cells rather than pixels, so dragging and
+  zooming with the mouse in the viewer are slightly coarser.
 - merman is pre-1.0. Its output is very close to mermaid.js, but not identical.
 
 ## Development
@@ -119,8 +155,9 @@ cargo test --test e2e gallery -- --ignored   # contact sheets of every diagram t
 MER_E2E_DUMP=1 cargo test --test e2e         # save decoded frames to target/tmp/e2e
 ```
 
-The end-to-end tests run `mer` on a pseudo-terminal that answers its capability probe like
-Ghostty does, then decode the images and placeholder grids it writes.
+The end-to-end tests run `mer` on a pseudo-terminal that answers its queries like Ghostty does,
+including behind a real tmux when it is installed, then decode the images and placeholder grids
+it writes.
 
 The Inter font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/LICENSE-Inter.txt`.

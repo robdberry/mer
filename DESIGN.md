@@ -1,6 +1,6 @@
 # mer — design proposal
 
-> Status: draft · open questions resolved 2026-09-11 (§15)
+> Status: implemented · §16 records where the build differs from this proposal
 
 `mer` renders Mermaid diagrams as real graphics inside the terminal, the way `viu` shows images:
 
@@ -522,3 +522,61 @@ Resolved 2026-09-11:
 - **ratatui + ratatui-image for the viewer.** A good general image widget, but `mer` needs placeholder grids, shm transport, viewport re-rendering and newest-wins scheduling. A small purpose-built Kitty module is simpler than adapting it.
 - **Mermaid's system font stack (`trebuchet ms`, verdana, arial).** Matches mermaid.js on macOS, but output changes from machine to machine, including over SSH to Linux hosts. An embedded font was chosen instead.
 - **Half-block (`▀`) pixel fallback.** Labels are illegible at that resolution; the Unicode diagram renderer is a better fallback.
+
+## 16. As built
+
+Where the implementation departs from the proposal above, and why.
+
+**Text measurement.**
+- Implementing merman's `TextMeasurer` outright would have meant re-deriving about twenty browser measurement quirks.
+- Instead, `mer` wraps merman's deterministic measurer and scales only its widths, by the ratio of Inter's shaped width to the measurer's own width for the same text.
+- Shaping uses harfrust, the shaper resvg itself uses, not rustybuzz.
+- Wrapping, overhangs and line heights stay merman's.
+
+**Terminal input.**
+- There is no crossterm; `term/tty.rs` and `term/input.rs` handle `/dev/tty` directly.
+- `select` waits for input, because on macOS `poll` reports terminal devices as ready without data.
+- `signal-hook` restores the terminal on SIGTERM and SIGHUP.
+
+**Watching.** Files are polled for size and modification time every 150 ms instead of using `notify`. Polling also catches editors that save by renaming.
+
+**Markdown.** A line-based fence scanner replaces pulldown-cmark, so the same code serves files and streams. Code frames are formatted by hand.
+
+**Streams.**
+- Input goes live if it hasn't ended within 400 ms. Previews render after 80 ms without new input.
+- The final frame is identical to one-shot output.
+- NUL-separated documents always print one after another, and `--append` was dropped, so output doesn't depend on timing.
+
+**Terminal theme.**
+- The `base` theme falls back to its light defaults for several variables, so about 130 are set explicitly.
+- Categorical colors (pie slices, git branches, mindmap and timeline sections) come from ANSI colors 1–6, queried with OSC 4.
+- Packet diagrams take colors from the `packet` configuration section rather than theme variables.
+- Mermaid's root `background-color: white` is replaced with `transparent`.
+- C4 diagrams keep Mermaid's fixed colors.
+
+**No graphics.**
+- Without kitty graphics, diagrams are drawn by merman's Unicode renderer, and `--protocol text` forces it.
+- Live modes and the viewer need images.
+
+**tmux.**
+- Graphics sequences are wrapped for passthrough.
+- Image ids are limited to 8 bits and encoded as palette colors, which tmux keeps intact.
+- tmux answers DA1 itself, ahead of replies forwarded from the terminal, so inside tmux the probe waits up to 250 ms after DA1 for the graphics reply.
+- The end-to-end suite runs a real tmux to check this.
+
+**Viewer.** Each diagram's SVG tree is cached. Every view change rasterizes only the viewport with a scale-and-translate transform.
+
+**Configuration.** `~/.config/mer/config.toml` sets `theme`, `background`, `scale`, `fit`, `protocol` and a `[mermaid]` table.
+
+**Not built.**
+- `--font`, `--engine mmdc`, the kitty keyboard protocol and a Homebrew tap.
+- Shared-memory transport. Its benefit is small: a full 5K viewer frame (55 MB of pixels) lays out in 10 ms, rasterizes in 43 ms and encodes to 550 KB in 8 ms, so encoding isn't the bottleneck.
+
+**Measured.** The release build on Apple Silicon, from process start to exit on a pseudo-terminal with the probe answered, takes:
+
+| Diagram | Time |
+|---|---|
+| State | 13 ms |
+| Class | 19 ms |
+| Sequence | 22 ms |
+| Flowchart (the sample with a subgraph) | 23 ms |

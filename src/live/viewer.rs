@@ -26,7 +26,7 @@ use crate::input::{self, Diagram};
 use crate::raster::{self, Rasterizer};
 use crate::size::{self, Grid};
 use crate::term::input::{Event, Key, Mouse, MouseKind};
-use crate::term::kitty;
+use crate::term::{self, kitty};
 use crate::theme::Rgb;
 
 /// Zoom factor for one key press.
@@ -411,13 +411,27 @@ impl Viewer {
         self.stale = true;
     }
 
+    /// The pointer in viewport pixels. Inside tmux, which reports cells, the cell's center
+    /// stands in for it.
+    fn pointer(&self, mouse: Mouse) -> (f32, f32) {
+        if term::inside_tmux() {
+            let grid = self.session.grid;
+            (
+                (mouse.x as f32 + 0.5) * grid.cell_w as f32,
+                (mouse.y as f32 + 0.5) * grid.cell_h as f32,
+            )
+        } else {
+            (mouse.x as f32, mouse.y as f32)
+        }
+    }
+
     fn mouse(&mut self, mouse: Mouse) {
         let viewport = self.viewport_pixels();
         let limits = self.zoom_limits();
+        let point = self.pointer(mouse);
         let (Some(view), Some(size)) = (self.view.as_mut(), self.size) else {
             return;
         };
-        let point = (mouse.x as f32, mouse.y as f32);
         match mouse.kind {
             MouseKind::Press(0) => {
                 self.drag = Some(Drag {
