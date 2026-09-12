@@ -99,15 +99,9 @@ pub fn run(
         elapsed: Duration::ZERO,
         notes: Vec::new(),
     };
+    // Dropping the viewer turns these off again, also when a panic unwinds.
     write_stdout(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1016h")?;
     let result = viewer.run(inbox);
-
-    let mut out = Vec::new();
-    if let Some(id) = viewer.image.take() {
-        let _ = kitty::delete(&mut out, id);
-    }
-    out.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l");
-    let _ = write_stdout(&out);
     stop.store(true, Ordering::Relaxed);
     result
 }
@@ -219,6 +213,14 @@ struct Drag {
     center: (f32, f32),
 }
 
+/// The image on screen: its id, and the size its placeholder grid was drawn for.
+#[derive(Clone, Copy)]
+struct Shown {
+    id: u32,
+    pixels: (u32, u32),
+    cells: (u16, u16),
+}
+
 struct Viewer {
     session: Session,
     worker: Worker<Job>,
@@ -234,7 +236,7 @@ struct Viewer {
     stale: bool,
     reload: bool,
     drag: Option<Drag>,
-    image: Option<u32>,
+    image: Option<Shown>,
     elapsed: Duration,
     /// Error lines shown instead of a diagram.
     notes: Vec<String>,
@@ -508,19 +510,33 @@ impl Viewer {
 
     fn draw(&mut self, shot: &Shot) -> io::Result<()> {
         let mut out = Vec::with_capacity(shot.rgba.len() / 8);
-        out.extend_from_slice(b"\x1b[?2026h\x1b[H\x1b[2J");
-        let id = kitty::random_id();
-        kitty::transmit_virtual(&mut out, id, &shot.rgba, shot.pixels, shot.cells)?;
-        let mut cells = String::new();
-        for row in 0..shot.cells.1 {
-            kitty::placeholder_row(&mut cells, id, row, shot.cells.0);
-            cells.push_str("\r\n");
+        out.extend_from_slice(b"\x1b[?2026h");
+        match self.image {
+            // Pixels sent under the id on screen replace the picture in place.
+            Some(shown) if shown.pixels == shot.pixels && shown.cells == shot.cells => {
+                kitty::transmit_virtual(&mut out, shown.id, &shot.rgba, shot.pixels, shot.cells)?;
+            }
+            previous => {
+                let id = kitty::random_id();
+                out.extend_from_slice(b"\x1b[H\x1b[2J");
+                kitty::transmit_virtual(&mut out, id, &shot.rgba, shot.pixels, shot.cells)?;
+                let mut cells = String::new();
+                for row in 0..shot.cells.1 {
+                    kitty::placeholder_row(&mut cells, id, row, shot.cells.0);
+                    cells.push_str("\r\n");
+                }
+                out.extend_from_slice(cells.as_bytes());
+                if let Some(old) = previous {
+                    kitty::delete(&mut out, old.id)?;
+                }
+                self.image = Some(Shown {
+                    id,
+                    pixels: shot.pixels,
+                    cells: shot.cells,
+                });
+            }
         }
-        out.extend_from_slice(cells.as_bytes());
         self.write_status(&mut out);
-        if let Some(old) = self.image.replace(id) {
-            kitty::delete(&mut out, old)?;
-        }
         out.extend_from_slice(b"\x1b[?2026l");
         write_stdout(&out)
     }
@@ -534,10 +550,22 @@ impl Viewer {
         }
         self.write_status(&mut out);
         if let Some(old) = self.image.take() {
-            kitty::delete(&mut out, old)?;
+            kitty::delete(&mut out, old.id)?;
         }
         out.extend_from_slice(b"\x1b[?2026l");
         write_stdout(&out)
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        // Deletes the image and turns off what `run` turned on, also when a panic unwinds.
+        let mut out = Vec::new();
+        if let Some(shown) = self.image.take() {
+            let _ = kitty::delete(&mut out, shown.id);
+        }
+        out.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l");
+        let _ = write_stdout(&out);
     }
 }
 

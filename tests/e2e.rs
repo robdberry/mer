@@ -892,6 +892,8 @@ fn viewer_pans_zooms_and_quits() {
     let images = images(&run.output);
     let viewport = (u32::from(COLS) * CELL.0, u32::from(ROWS - 1) * CELL.1);
     assert!(images.iter().all(|image| image.size == viewport));
+    assert!(images.iter().all(|image| image.id == images[0].id), "frames update one image");
+    assert_grid(&run.output, &images[0]);
     assert!(images[0].rgba != images[1].rgba, "zooming changed the picture");
     assert!(images[1].rgba != images[2].rgba, "panning changed the picture");
     assert!(images[2].rgba != images[3].rgba, "scrolling zoomed the picture");
