@@ -169,5 +169,14 @@ The end-to-end tests run `mer` on a pseudo-terminal that answers its queries lik
 including behind a real tmux when it is installed, then decode the images and placeholder grids
 it writes.
 
-The Inter font is licensed under the SIL Open Font License 1.1; see
+## License
+
+`mer` is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.
+
+The embedded Inter font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/LICENSE-Inter.txt`.
