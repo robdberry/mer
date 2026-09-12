@@ -66,8 +66,13 @@ pub fn delete(out: &mut impl Write, id: u32) -> io::Result<()> {
 /// Appends one row of placeholder cells for image `id`, wrapped in the foreground color that
 /// encodes the id. The caller adds the line break.
 pub fn placeholder_row(out: &mut String, id: u32, row: u16, cols: u16) {
-    let [_, r, g, b] = id.to_be_bytes();
-    let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
+    if id <= 0xff {
+        // A palette index survives multiplexers that downsample truecolor.
+        let _ = write!(out, "\x1b[38;5;{id}m");
+    } else {
+        let [_, r, g, b] = id.to_be_bytes();
+        let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
+    }
     let row_mark = DIACRITICS[usize::from(row)];
     for col in 0..cols {
         out.push(PLACEHOLDER);
@@ -77,13 +82,15 @@ pub fn placeholder_row(out: &mut String, id: u32, row: u16, cols: u16) {
     out.push_str("\x1b[39m");
 }
 
-/// A random 24-bit image id. Ids have to fit a truecolor foreground, and randomness keeps them
-/// from colliding with images other programs have put on the same screen.
+/// A random image id. Ids have to fit the foreground color that marks placeholder cells:
+/// 24 bits normally, 8 bits inside tmux, which may turn truecolor into palette colors.
+/// Randomness keeps them from colliding with images other programs have put on the screen.
 pub fn random_id() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write_u32(std::process::id());
-    ((hasher.finish() & 0xff_ffff) as u32).max(1)
+    let mask = if super::inside_tmux() { 0xff } else { 0xff_ffff };
+    ((hasher.finish() & mask) as u32).max(1)
 }
 
 #[cfg(test)]
@@ -164,6 +171,13 @@ mod tests {
             "\x1b[38;2;18;52;86m{p}\u{30D}\u{305}{p}\u{30D}\u{30D}{p}\u{30D}\u{30E}\x1b[39m"
         );
         assert_eq!(row, expected);
+    }
+
+    #[test]
+    fn small_ids_use_palette_colors() {
+        let mut row = String::new();
+        placeholder_row(&mut row, 200, 0, 1);
+        assert!(row.starts_with("\x1b[38;5;200m"));
     }
 
     #[test]

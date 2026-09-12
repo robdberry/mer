@@ -2,9 +2,10 @@
 
 mod measure;
 
+use merman::ascii::{AsciiRenderOptions, AsciiViewportPolicy, OverflowPolicy};
 use merman::svg::{RootBackgroundPostprocessor, SvgPipeline};
 use merman::{
-    MermaidConfig, ParseOptions, RenderError, RenderOutput, RenderRequest, Renderer,
+    AsciiRequest, MermaidConfig, ParseOptions, RenderError, RenderOutput, RenderRequest, Renderer,
     SvgEnvironment, SvgRequest,
 };
 use serde_json::Value;
@@ -52,20 +53,46 @@ impl Engine {
         let request = RenderRequest::svg(source, control, self.request.clone());
         match self.renderer.render(request) {
             Ok(RenderOutput::Svg(Some(output))) => Ok(output.into_parts().0),
-            Ok(_) | Err(RenderError::NoDiagram) => Err(Failure::Empty),
-            Err(RenderError::Cancelled(_)) => Err(Failure::Cancelled),
-            Err(RenderError::Parse(diagnostic)) => Err(Failure::Diagnostic(Diagnostic {
-                message: without_prefix(&diagnostic.terminal_safe_message()),
-                span: diagnostic
-                    .terminal_diagnostic_details()
-                    .span
-                    .map(|span| (span.start, span.end)),
-            })),
-            Err(other) => Err(Failure::Diagnostic(Diagnostic {
-                message: other.to_string(),
+            Ok(_) => Err(Failure::Empty),
+            Err(err) => Err(failure(err)),
+        }
+    }
+
+    /// Draws one diagram with Unicode box-drawing characters, at most `width` columns wide
+    /// where the diagram allows.
+    pub fn render_text(&self, source: &str, width: usize) -> Result<String, Failure> {
+        let request = AsciiRequest {
+            options: AsciiRenderOptions::unicode(),
+            viewport: AsciiViewportPolicy::with_max_width(width).overflow(OverflowPolicy::Fallback),
+            ..AsciiRequest::default()
+        };
+        match self.renderer.render(RenderRequest::ascii(source, Control::new(), request)) {
+            Ok(RenderOutput::Ascii(Some(output))) => Ok(output.text),
+            Ok(_) => Err(Failure::Empty),
+            Err(RenderError::Ascii(err)) => Err(Failure::Diagnostic(Diagnostic {
+                message: format!("{err}; write an image with -o FILE instead"),
                 span: None,
             })),
+            Err(err) => Err(failure(err)),
         }
+    }
+}
+
+fn failure(err: RenderError) -> Failure {
+    match err {
+        RenderError::NoDiagram => Failure::Empty,
+        RenderError::Cancelled(_) => Failure::Cancelled,
+        RenderError::Parse(diagnostic) => Failure::Diagnostic(Diagnostic {
+            message: without_prefix(&diagnostic.terminal_safe_message()),
+            span: diagnostic
+                .terminal_diagnostic_details()
+                .span
+                .map(|span| (span.start, span.end)),
+        }),
+        other => Failure::Diagnostic(Diagnostic {
+            message: other.to_string(),
+            span: None,
+        }),
     }
 }
 
@@ -125,6 +152,25 @@ mod tests {
             engine().render_svg("flowchart LR\n A --> B\n", control),
             Err(Failure::Cancelled)
         ));
+    }
+
+    #[test]
+    fn draws_diagrams_as_text() {
+        let text = engine()
+            .render_text("flowchart LR\n  A[Start] --> B[Done]\n", 80)
+            .unwrap();
+        assert!(text.contains("Start") && text.contains("Done"), "{text}");
+        assert!(text.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c)), "{text}");
+    }
+
+    #[test]
+    fn text_output_names_what_it_cannot_draw() {
+        let Err(Failure::Diagnostic(diagnostic)) =
+            engine().render_text("pie\n  \"Dogs\" : 3\n", 80)
+        else {
+            panic!("pie charts have no text rendering");
+        };
+        assert!(diagnostic.message.contains("-o FILE"), "{}", diagnostic.message);
     }
 
     #[test]

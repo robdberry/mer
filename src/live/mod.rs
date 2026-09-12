@@ -25,9 +25,8 @@ use crate::engine::{Control, Failure};
 use crate::render::{self, Frame, Renderer};
 use crate::size::{Fit, Grid};
 use crate::term::input::{Decoder, Event, Key};
-use crate::term::kitty;
-use crate::term::probe;
 use crate::term::tty::{RawMode, Tty};
+use crate::term::{self, kitty, probe};
 use crate::theme::{Palette, Rgb};
 
 /// How often the main loop wakes up when nothing arrives.
@@ -416,7 +415,7 @@ impl Drop for Session {
 
 fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    out.write_all(bytes)?;
+    out.write_all(&term::for_terminal(bytes))?;
     out.flush()
 }
 

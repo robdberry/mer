@@ -64,16 +64,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     }
     if cli.interactive {
         let diagrams = load(cli)?;
+        let setup = graphics_setup(cli, "--interactive")?;
         let paths = cli
             .inputs
             .iter()
             .filter(|path| path.as_os_str() != "-")
             .cloned()
             .collect();
-        return live::viewer::run(Setup::new(cli)?, diagrams, paths, cli.watch);
+        return live::viewer::run(setup, diagrams, paths, cli.watch);
     }
     if cli.watch {
-        return live::watch::run(Setup::new(cli)?, cli.inputs.clone(), cli.diagram);
+        let setup = graphics_setup(cli, "--watch")?;
+        return live::watch::run(setup, cli.inputs.clone(), cli.diagram);
     }
     if cli.check {
         return check(cli, &load(cli)?);
@@ -82,10 +84,23 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         return export(cli, &load(cli)?, output);
     }
     if only_stdin && cli.diagram.is_none() {
-        return live::stream::run(Setup::new(cli)?, stdin_format(cli));
+        let setup = Setup::new(cli)?;
+        if setup.text {
+            return display::show(&setup, &load(cli)?);
+        }
+        return live::stream::run(setup, stdin_format(cli));
     }
     let diagrams = load(cli)?;
     display::show(&Setup::new(cli)?, &diagrams)
+}
+
+/// Setup for a mode that only works with images.
+fn graphics_setup(cli: &Cli, mode: &str) -> Result<Setup> {
+    let setup = Setup::new(cli)?;
+    if setup.text {
+        bail!("{mode} needs a terminal with the kitty graphics protocol");
+    }
+    Ok(setup)
 }
 
 fn stdin_format(cli: &Cli) -> Option<Format> {

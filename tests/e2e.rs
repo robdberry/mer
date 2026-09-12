@@ -1,5 +1,5 @@
-//! End-to-end tests: `mer` runs on a pseudo-terminal that answers its capability probe the way
-//! Ghostty does, and the tests decode what it writes back into images and placeholder grids.
+//! End-to-end tests: `mer` runs on a pseudo-terminal that answers its queries the way Ghostty
+//! does, and the tests decode what it writes back into images and placeholder grids.
 //!
 //! Set `MER_E2E_DUMP=1` to write decoded images to `target/tmp/e2e/`, composited over the fake
 //! terminal's background, for inspection.
@@ -25,28 +25,194 @@ const COLS: u16 = 120;
 const ROWS: u16 = 40;
 const CELL: (u32, u32) = (17, 34);
 const BACKGROUND: [u8; 3] = [0x1e, 0x1e, 0x2e];
+const LIGHT_BACKGROUND: [u8; 3] = [0xef, 0xf1, 0xf5];
 const PLACEHOLDER: char = '\u{10EEEE}';
 const TRANSMIT: &[u8] = b"a=T,U=1";
 
-/// What Ghostty sends back for mer's probe.
-const GHOSTTY: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;34;17t\x1b[4;1360;2040t\
-\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\
-\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\\x1b]4;2;rgb:a6a6/e3e3/a1a1\x1b\\\
-\x1b]4;3;rgb:f9f9/e2e2/afaf\x1b\\\x1b]4;4;rgb:8989/b4b4/fafa\x1b\\\
-\x1b]4;5;rgb:cbcb/a6a6/f7f7\x1b\\\x1b]4;6;rgb:9494/e2e2/d5d5\x1b\\\
-\x1b[?997;1n\x1b[?62;22c";
+/// How a fake terminal answers queries.
+#[derive(Clone, Copy)]
+struct Profile {
+    kitty: bool,
+    /// Whether it reports sizes, colors and its color scheme.
+    reports: bool,
+    dark: bool,
+    fg: &'static str,
+    bg: &'static str,
+    /// ANSI colors 1 to 6.
+    ansi: [&'static str; 6],
+}
 
-/// A light terminal theme.
-const LIGHT_TERMINAL: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;34;17t\x1b[4;1360;2040t\
-\x1b]10;rgb:4c4c/4f4f/6969\x1b\\\x1b]11;rgb:efef/f1f1/f5f5\x1b\\\
-\x1b]4;1;rgb:d2d2/0f0f/3939\x1b\\\x1b]4;2;rgb:4040/a0a0/2b2b\x1b\\\
-\x1b]4;3;rgb:dfdf/8e8e/1d1d\x1b\\\x1b]4;4;rgb:1e1e/6666/f5f5\x1b\\\
-\x1b]4;5;rgb:8888/3939/efef\x1b\\\x1b]4;6;rgb:1717/9292/9999\x1b\\\
-\x1b[?997;2n\x1b[?62;22c";
-const LIGHT_BACKGROUND: [u8; 3] = [0xef, 0xf1, 0xf5];
+const GHOSTTY: Profile = Profile {
+    kitty: true,
+    reports: true,
+    dark: true,
+    fg: "cdcd/d6d6/f4f4",
+    bg: "1e1e/1e1e/2e2e",
+    ansi: [
+        "f3f3/8b8b/a8a8",
+        "a6a6/e3e3/a1a1",
+        "f9f9/e2e2/afaf",
+        "8989/b4b4/fafa",
+        "cbcb/a6a6/f7f7",
+        "9494/e2e2/d5d5",
+    ],
+};
 
-/// A terminal that answers DA1 and nothing else.
-const PLAIN_TERMINAL: &[u8] = b"\x1b[?62;22c";
+const LIGHT_TERMINAL: Profile = Profile {
+    dark: false,
+    fg: "4c4c/4f4f/6969",
+    bg: "efef/f1f1/f5f5",
+    ansi: [
+        "d2d2/0f0f/3939",
+        "4040/a0a0/2b2b",
+        "dfdf/8e8e/1d1d",
+        "1e1e/6666/f5f5",
+        "8888/3939/efef",
+        "1717/9292/9999",
+    ],
+    ..GHOSTTY
+};
+
+/// A terminal without graphics that answers device attribute queries and nothing else.
+const PLAIN_TERMINAL: Profile = Profile {
+    kitty: false,
+    reports: false,
+    ..GHOSTTY
+};
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ParseState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+    Apc,
+    ApcEscape,
+    Dcs,
+    DcsEscape,
+}
+
+/// Follows a program's output and collects answers to its queries, in order.
+#[derive(Default)]
+struct Responder {
+    state: ParseState,
+    body: Vec<u8>,
+}
+
+impl Responder {
+    fn feed(&mut self, bytes: &[u8], profile: &Profile, replies: &mut Vec<u8>) {
+        use ParseState::*;
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (Ground, 0x1b) => Escape,
+                (Ground, _) => Ground,
+                (Escape, b'[' | b']' | b'_' | b'P') => {
+                    self.body.clear();
+                    match byte {
+                        b'[' => Csi,
+                        b']' => Osc,
+                        b'_' => Apc,
+                        _ => Dcs,
+                    }
+                }
+                (Escape, 0x1b) => Escape,
+                (Escape, _) => Ground,
+                (Csi, 0x40..=0x7e) => {
+                    self.body.push(byte);
+                    answer_csi(&self.body, profile, replies);
+                    Ground
+                }
+                (Csi, _) => {
+                    self.body.push(byte);
+                    Csi
+                }
+                (Osc, 0x07) => {
+                    answer_osc(&self.body, profile, replies);
+                    Ground
+                }
+                (Osc, 0x1b) => OscEscape,
+                (Osc, _) => {
+                    self.body.push(byte);
+                    Osc
+                }
+                (OscEscape, b'\\') => {
+                    answer_osc(&self.body, profile, replies);
+                    Ground
+                }
+                (OscEscape, _) => Ground,
+                (Apc, 0x1b) => ApcEscape,
+                (Apc, _) => {
+                    // The control keys come first; payloads can be large.
+                    if self.body.len() < 256 {
+                        self.body.push(byte);
+                    }
+                    Apc
+                }
+                (ApcEscape, b'\\') => {
+                    answer_apc(&self.body, profile, replies);
+                    Ground
+                }
+                (ApcEscape, _) => Ground,
+                (Dcs, 0x1b) => DcsEscape,
+                (Dcs, _) => Dcs,
+                (DcsEscape, b'\\') => Ground,
+                (DcsEscape, _) => Dcs,
+            };
+        }
+    }
+}
+
+fn answer_csi(body: &[u8], profile: &Profile, replies: &mut Vec<u8>) {
+    let reply = match body {
+        b"c" | b"0c" => b"\x1b[?62;22c".to_vec(),
+        b">c" | b">0c" => b"\x1b[>1;10;0c".to_vec(),
+        b">q" | b">0q" => b"\x1bP>|ghostty 1.3.1\x1b\\".to_vec(),
+        b"16t" if profile.reports => format!("\x1b[6;{};{}t", CELL.1, CELL.0).into_bytes(),
+        b"14t" if profile.reports => {
+            let (w, h) = (u32::from(COLS) * CELL.0, u32::from(ROWS) * CELL.1);
+            format!("\x1b[4;{h};{w}t").into_bytes()
+        }
+        b"?996n" if profile.reports => {
+            format!("\x1b[?997;{}n", if profile.dark { 1 } else { 2 }).into_bytes()
+        }
+        _ => return,
+    };
+    replies.extend_from_slice(&reply);
+}
+
+fn answer_osc(body: &[u8], profile: &Profile, replies: &mut Vec<u8>) {
+    if !profile.reports {
+        return;
+    }
+    let body = String::from_utf8_lossy(body);
+    let color = match body.as_ref() {
+        "10;?" => format!("10;rgb:{}", profile.fg),
+        "11;?" => format!("11;rgb:{}", profile.bg),
+        other => match other.strip_prefix("4;").and_then(|rest| rest.strip_suffix(";?")) {
+            Some(index @ ("1" | "2" | "3" | "4" | "5" | "6")) => {
+                let n: usize = index.parse().unwrap();
+                format!("4;{index};rgb:{}", profile.ansi[n - 1])
+            }
+            _ => return,
+        },
+    };
+    replies.extend_from_slice(format!("\x1b]{color}\x1b\\").as_bytes());
+}
+
+fn answer_apc(body: &[u8], profile: &Profile, replies: &mut Vec<u8>) {
+    let body = String::from_utf8_lossy(body);
+    let Some(control) = body.strip_prefix('G') else {
+        return;
+    };
+    let keys = control.split(';').next().unwrap_or("");
+    if !profile.kitty || !keys.split(',').any(|kv| kv == "a=q") {
+        return;
+    }
+    let id = keys.split(',').find(|kv| kv.starts_with("i=")).unwrap_or("i=0");
+    replies.extend_from_slice(format!("\x1b_G{id};OK\x1b\\").as_bytes());
+}
 
 struct Run {
     status: i32,
@@ -115,8 +281,8 @@ enum Stdin {
     Pipe,
 }
 
-/// `mer` running with a pseudo-terminal as its controlling terminal and stdout. The terminal
-/// sends `replies` when it sees the DA1 query that ends the capability probe.
+/// A program running with a pseudo-terminal as its controlling terminal and stdout, which
+/// answers its queries according to a profile.
 struct Terminal {
     child: Child,
     keyboard: File,
@@ -127,12 +293,23 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn spawn(args: &[&str], stdin: Stdin, replies: &'static [u8]) -> Terminal {
+    fn spawn(args: &[&str], stdin: Stdin, profile: Profile) -> Terminal {
+        Terminal::spawn_program(MER, args, stdin, profile, &[])
+    }
+
+    fn spawn_program(
+        program: &str,
+        args: &[&str],
+        stdin: Stdin,
+        profile: Profile,
+        env: &[(&str, &str)],
+    ) -> Terminal {
         let spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
         let (master, slave) = open_pty();
-        let mut command = Command::new(MER);
+        let mut command = Command::new(program);
         command
             .args(args)
+            .envs(env.iter().copied())
             .env("MER_PROBE_TIMEOUT_MS", "300")
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::piped());
@@ -148,7 +325,7 @@ impl Terminal {
                 Ok(())
             });
         }
-        let mut child = command.spawn().expect("spawn mer");
+        let mut child = command.spawn().expect("spawn the program");
         drop(command);
         drop(slave);
         drop(spawning);
@@ -160,14 +337,15 @@ impl Terminal {
         let screen = thread::spawn({
             let output = Arc::clone(&output);
             move || {
+                let mut responder = Responder::default();
+                let mut replies = Vec::new();
                 let mut buf = [0u8; 1 << 16];
-                let mut answered = false;
                 while let Ok(n @ 1..) = master.read(&mut buf) {
-                    let mut output = output.lock().unwrap();
-                    output.extend_from_slice(&buf[..n]);
-                    if !answered && contains(&output, b"\x1b[c") {
-                        answer.write_all(replies).unwrap();
-                        answered = true;
+                    responder.feed(&buf[..n], &profile, &mut replies);
+                    output.lock().unwrap().extend_from_slice(&buf[..n]);
+                    if !replies.is_empty() {
+                        let _ = answer.write_all(&replies);
+                        replies.clear();
                     }
                 }
             }
@@ -188,8 +366,8 @@ impl Terminal {
         }
     }
 
-    /// Waits until the output so far satisfies `condition`. On timeout, mer is stopped and
-    /// its stderr is reported with the end of its output.
+    /// Waits until the output so far satisfies `condition`. On timeout, the program is stopped
+    /// and its stderr is reported with the end of its output.
     fn wait_for(&mut self, what: &str, condition: impl Fn(&[u8]) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -220,7 +398,7 @@ impl Terminal {
         self.stdin.take();
     }
 
-    /// Waits for mer to exit and collects what it wrote.
+    /// Waits for the program to exit and collects what it wrote.
     fn finish(mut self) -> Run {
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
@@ -229,7 +407,7 @@ impl Terminal {
             }
             if Instant::now() > deadline {
                 let _ = self.child.kill();
-                panic!("mer did not exit");
+                panic!("the program did not exit");
             }
             thread::sleep(Duration::from_millis(10));
         };
@@ -246,15 +424,15 @@ impl Terminal {
 }
 
 /// Runs mer to completion on a terminal, with `stdin` piped in when given.
-fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, replies: &'static [u8]) -> Run {
+fn run_in_terminal(args: &[&str], stdin: Option<Vec<u8>>, profile: Profile) -> Run {
     match stdin {
         Some(data) => {
-            let mut terminal = Terminal::spawn(args, Stdin::Pipe, replies);
+            let mut terminal = Terminal::spawn(args, Stdin::Pipe, profile);
             terminal.write_stdin(&data);
             terminal.close_stdin();
             terminal.finish()
         }
-        None => Terminal::spawn(args, Stdin::Terminal, replies).finish(),
+        None => Terminal::spawn(args, Stdin::Terminal, profile).finish(),
     }
 }
 
@@ -334,8 +512,12 @@ fn images(output: &[u8]) -> Vec<Image> {
 /// Checks that the placeholder grid for `image` has one line per row, each one cell per column.
 fn assert_grid(output: &[u8], image: &Image) {
     let text = String::from_utf8_lossy(output);
-    let [_, r, g, b] = image.id.to_be_bytes();
-    let color = format!("\x1b[38;2;{r};{g};{b}m");
+    let color = if image.id <= 0xff {
+        format!("\x1b[38;5;{}m", image.id)
+    } else {
+        let [_, r, g, b] = image.id.to_be_bytes();
+        format!("\x1b[38;2;{r};{g};{b}m")
+    };
     let rows: Vec<&str> = text
         .split('\n')
         .filter_map(|line| line.split_once(&color).map(|(_, rest)| rest))
@@ -406,11 +588,11 @@ fn dump(name: &str, image: &Image) {
 #[ignore]
 fn gallery() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gallery");
-    for (name, replies, background) in [
+    for (name, profile, background) in [
         ("dark", GHOSTTY, BACKGROUND),
         ("light", LIGHT_TERMINAL, LIGHT_BACKGROUND),
     ] {
-        let run = run_in_terminal(&[&fixture("gallery.md")], None, replies);
+        let run = run_in_terminal(&[&fixture("gallery.md")], None, profile);
         if run.status != 0 {
             eprintln!("{name}: exit {}\n{}", run.status, run.stderr);
         }
@@ -485,10 +667,23 @@ fn syntax_errors_show_a_code_frame() {
 }
 
 #[test]
-fn terminals_without_graphics_get_a_clear_error() {
-    let run = run_in_terminal(&[&fixture("flowchart.mmd")], None, PLAIN_TERMINAL);
-    assert_eq!(run.status, 2);
-    assert!(run.stderr.contains("kitty graphics protocol"), "{}", run.stderr);
+fn terminals_without_graphics_get_text_diagrams() {
+    let path = scratch_file("plain.mmd", "flowchart LR\n  A[Parse] --> B[Layout] --> C[Rasterize]\n");
+    let run = run_in_terminal(&[path.to_str().unwrap()], None, PLAIN_TERMINAL);
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("drawn as text"), "{}", run.stderr);
+    assert!(images(&run.output).is_empty());
+    let text = String::from_utf8_lossy(&run.output);
+    assert!(text.contains("Rasterize") && text.contains('─'), "{text}");
+}
+
+#[test]
+fn text_protocol_works_without_a_terminal() {
+    let path = scratch_file("text.mmd", "flowchart LR\n  A[Parse] --> B[Layout] --> C[Rasterize]\n");
+    let run = run_plain(&["--protocol", "text", path.to_str().unwrap()]);
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    let text = String::from_utf8_lossy(&run.output);
+    assert!(text.contains("Layout") && !text.contains('\x1b'), "{text}");
 }
 
 #[test]
@@ -645,6 +840,59 @@ fn viewer_moves_between_diagrams() {
     let run = terminal.finish();
     assert_eq!(run.status, 0, "stderr: {}", run.stderr);
     assert!(images(&run.output).len() >= 2);
+}
+
+/// Stops a private tmux server when dropped.
+struct TmuxServer(String);
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux").args(["-L", &self.0, "kill-server"]).output();
+    }
+}
+
+#[test]
+fn images_pass_through_tmux() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux is not installed; skipping");
+        return;
+    }
+    let server = TmuxServer(format!("mer-e2e-{}", std::process::id()));
+    let config = scratch_file("tmux.conf", "set -g allow-passthrough on\nset -g status off\n");
+    let exit_file = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("scratch/tmux-exit");
+    let _ = fs::remove_file(&exit_file);
+    let command = format!(
+        "{MER} {}; echo $? > {}; sleep 5",
+        fixture("flowchart.mmd"),
+        exit_file.display()
+    );
+    let args = [
+        "-L",
+        &server.0,
+        "-f",
+        config.to_str().unwrap(),
+        "new-session",
+        "-x",
+        "120",
+        "-y",
+        "40",
+        &command,
+    ];
+    let env = [("TERM", "xterm-256color")];
+    let mut terminal = Terminal::spawn_program("tmux", &args, Stdin::Terminal, GHOSTTY, &env);
+    terminal.wait_for("an image passed through tmux", |out| contains(out, TRANSMIT));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !exit_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(server);
+    let run = terminal.finish();
+    let exit = fs::read_to_string(&exit_file).unwrap_or_default();
+    assert_eq!(exit.trim(), "0", "mer's exit status inside tmux");
+    let images = images(&run.output);
+    assert_eq!(images.len(), 1);
+    assert!(images[0].id <= 0xff, "image ids fit a palette color inside tmux");
+    assert!(visible_pixels(&images[0]) > 5_000);
 }
 
 #[test]

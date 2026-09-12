@@ -11,14 +11,14 @@ use serde_json::{Value, json};
 
 use crate::cli::{Cli, FitArg, Protocol};
 use crate::diag::{self, Diagnostic};
-use crate::engine::{Control, Failure};
+use crate::engine::{Control, Engine, Failure};
 use crate::fonts;
 use crate::input::Diagram;
 use crate::render::{self, Renderer};
 use crate::size::{self, Fit, Grid};
-use crate::term::kitty;
 use crate::term::probe::{self, Caps};
 use crate::term::tty::Tty;
+use crate::term::{self, kitty};
 use crate::theme::{self, Palette, Rgb};
 
 /// Everything needed to draw diagrams in this terminal.
@@ -33,6 +33,8 @@ pub struct Setup {
     pub user_config: Option<Value>,
     pub config: Value,
     pub background: Option<Rgb>,
+    /// Diagrams are drawn with box-drawing characters instead of images.
+    pub text: bool,
     /// Whether diagnostics on stderr are colored.
     pub color: bool,
 }
@@ -40,26 +42,49 @@ pub struct Setup {
 impl Setup {
     /// Probes the terminal and settles size, theme and background.
     pub fn new(cli: &Cli) -> Result<Setup> {
-        let forced = cli.protocol == Protocol::Kitty;
-        if !forced && !io::stdout().is_terminal() {
-            bail!(
-                "stdout is not a terminal; write an image with -o FILE, or force output with --protocol kitty"
-            );
-        }
-        let (tty, caps) = match Tty::open() {
-            Ok(tty) => {
-                let caps = probe::probe(&tty, probe_timeout())?;
-                (Some(tty), caps)
+        let theme = cli.theme.clone().unwrap_or_else(|| "terminal".to_string());
+        let user_config = user_config(cli.config.as_deref())?;
+        let (tty, caps, text) = match cli.protocol {
+            Protocol::Text => {
+                let tty = Tty::open().ok();
+                let cols = tty.as_ref().and_then(|tty| tty.winsize().ok()).map_or(0, |size| size.ws_col);
+                let caps = Caps {
+                    cols,
+                    ..Caps::default()
+                };
+                (tty, caps, true)
             }
-            Err(_) if forced => (None, Caps::default()),
-            Err(err) => return Err(err).context("cannot open the terminal (/dev/tty)"),
+            Protocol::Kitty | Protocol::Auto => {
+                let forced = cli.protocol == Protocol::Kitty;
+                if !forced && !io::stdout().is_terminal() {
+                    bail!(
+                        "stdout is not a terminal; write an image with -o FILE, draw text with \
+                         --protocol text, or force graphics with --protocol kitty"
+                    );
+                }
+                let (tty, caps) = match Tty::open() {
+                    Ok(tty) => {
+                        let caps = probe::probe(&tty, probe_timeout())?;
+                        (Some(tty), caps)
+                    }
+                    Err(_) if forced => (None, Caps::default()),
+                    Err(err) => return Err(err).context("cannot open the terminal (/dev/tty)"),
+                };
+                let text = !forced && !caps.kitty_graphics;
+                if text {
+                    let hint = if term::inside_tmux() {
+                        " (inside tmux, add `set -g allow-passthrough on` to tmux.conf)"
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "mer: this terminal doesn't support the kitty graphics protocol{hint}, \
+                         so diagrams are drawn as text"
+                    );
+                }
+                (tty, caps, text)
+            }
         };
-        if !forced && !caps.kitty_graphics {
-            bail!(
-                "this terminal does not support the kitty graphics protocol; \
-                 use a terminal that does (such as Ghostty or kitty), or write an image with -o FILE"
-            );
-        }
         let (cell_w, cell_h) = caps.cell.unwrap_or((10, 20));
         let grid = Grid {
             cols: if caps.cols == 0 { 80 } else { caps.cols },
@@ -72,8 +97,6 @@ impl Setup {
             FitArg::Contain => Fit::Contain,
             FitArg::None => Fit::None,
         };
-        let theme = cli.theme.clone().unwrap_or_else(|| "terminal".to_string());
-        let user_config = user_config(cli.config.as_deref())?;
         let config = site_config(&theme, Some(&caps), user_config.as_ref());
         let background = background(cli.background.as_deref(), &theme, Some(&caps.palette))?;
         Ok(Setup {
@@ -86,6 +109,7 @@ impl Setup {
             user_config,
             config,
             background,
+            text,
             color: io::stderr().is_terminal(),
         })
     }
@@ -106,6 +130,9 @@ pub fn show(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
         eprintln!("mer: no Mermaid diagram found");
         return Ok(ExitCode::from(1));
     }
+    if setup.text {
+        return show_text(setup, diagrams);
+    }
     let mut renderer = Renderer::new(setup.config.clone(), setup.background);
     let mut stdout = io::stdout().lock();
     let mut failed = false;
@@ -118,7 +145,37 @@ pub fn show(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
                 }
                 render::write_inline(&mut out, &frame, kitty::random_id())?;
                 out.extend_from_slice(b"\x1b[?2026l");
-                stdout.write_all(&out)?;
+                stdout.write_all(&term::for_terminal(&out))?;
+                stdout.flush()?;
+            }
+            Err(failure) => {
+                stdout.flush()?;
+                report(&failure, diagram, setup.color);
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+fn show_text(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
+    let engine = Engine::new(setup.config.clone(), None);
+    let width = usize::from(setup.grid.cols.max(20));
+    let styled = io::stdout().is_terminal();
+    let mut stdout = io::stdout().lock();
+    let mut failed = false;
+    for diagram in diagrams {
+        match engine.render_text(&diagram.text, width) {
+            Ok(text) => {
+                match (&diagram.caption, styled) {
+                    (Some(caption), true) => writeln!(stdout, "\x1b[2m{caption}\x1b[22m")?,
+                    (Some(caption), false) => writeln!(stdout, "{caption}")?,
+                    (None, _) => {}
+                }
+                stdout.write_all(text.as_bytes())?;
+                if !text.ends_with('\n') {
+                    writeln!(stdout)?;
+                }
                 stdout.flush()?;
             }
             Err(failure) => {
@@ -135,11 +192,13 @@ pub fn doctor() -> Result<ExitCode> {
     let tty = Tty::open().context("cannot open the terminal (/dev/tty)")?;
     let caps = probe::probe(&tty, probe_timeout())?;
     let color = |rgb: Option<Rgb>| rgb.map_or_else(|| "not reported".to_string(), Rgb::hex);
+    let yes = |value: bool| if value { "yes" } else { "no" };
     let program = std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "unknown".to_string());
     let version = std::env::var("TERM_PROGRAM_VERSION").unwrap_or_default();
     println!("terminal          {program} {version}");
-    println!("responded         {}", if caps.responded { "yes" } else { "no" });
-    println!("kitty graphics    {}", if caps.kitty_graphics { "yes" } else { "no" });
+    println!("inside tmux       {}", yes(term::inside_tmux()));
+    println!("responded         {}", yes(caps.responded));
+    println!("kitty graphics    {}", yes(caps.kitty_graphics));
     println!("grid              {} × {} cells", caps.cols, caps.rows);
     match caps.cell {
         Some((w, h)) => println!(

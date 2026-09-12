@@ -746,10 +746,26 @@ version = "0.8.0-alpha.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e39537e033f102eda0fcd527e2cbe4135df670b90a4b2a3ad0b0a86466a709d6"
 dependencies = [
+ "merman-ascii",
  "merman-core",
  "merman-render",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "merman-ascii"
+version = "0.8.0-alpha.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "161b3f01fc975752ba9025d2a9427493e2197f4d0e068fbb8786af496a3dd56f"
+dependencies = [
+ "dugong",
+ "merman-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

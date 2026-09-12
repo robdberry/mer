@@ -60,7 +60,7 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
-    /// Graphics protocol; "kitty" skips detection and writes even when stdout is not a terminal
+    /// How diagrams are drawn
     #[arg(long, value_enum, default_value_t = Protocol::Auto)]
     pub protocol: Protocol,
 
@@ -91,8 +91,12 @@ pub enum OutputFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Protocol {
+    /// Kitty graphics when the terminal supports them, text otherwise
     Auto,
+    /// Kitty graphics, even when stdout is not a terminal
     Kitty,
+    /// Box-drawing characters, for any terminal or pipe
+    Text,
 }
 
 #[cfg(test)]

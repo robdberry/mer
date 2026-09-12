@@ -28,11 +28,20 @@ pub struct Caps {
 
 const KITTY_QUERY_ID: &str = "i=31";
 
-pub fn queries() -> String {
-    let mut q = format!("\x1b_G{KITTY_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
-    q.push_str("\x1b[16t\x1b[14t");
-    q.push_str(&color_queries());
-    q.push_str("\x1b[?996n\x1b[c");
+/// How long to wait for graphics replies after tmux has answered DA1 itself: tmux replies at
+/// once, while passthrough replies travel from the terminal behind it.
+const TMUX_GRACE: Duration = Duration::from_millis(250);
+
+pub fn queries(tmux: bool) -> Vec<u8> {
+    let kitty = format!("\x1b_G{KITTY_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    let mut q = if tmux {
+        super::passthrough(kitty.as_bytes())
+    } else {
+        kitty.into_bytes()
+    };
+    q.extend_from_slice(b"\x1b[16t\x1b[14t");
+    q.extend_from_slice(color_queries().as_bytes());
+    q.extend_from_slice(b"\x1b[?996n\x1b[c");
     q
 }
 
@@ -53,9 +62,10 @@ pub fn probe(tty: &Tty, timeout: Duration) -> io::Result<Caps> {
         ..Caps::default()
     };
     {
+        let tmux = super::inside_tmux();
         let _raw = tty.raw(false)?;
-        tty.write_all(queries().as_bytes())?;
-        let deadline = Instant::now() + timeout;
+        tty.write_all(&queries(tmux))?;
+        let mut deadline = Instant::now() + timeout;
         let mut parser = Parser::default();
         let mut buf = [0u8; 4096];
         'read: while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -65,8 +75,14 @@ pub fn probe(tty: &Tty, timeout: Duration) -> io::Result<Caps> {
                 Some(n) => n,
             };
             for seq in parser.feed(&buf[..n]) {
-                if apply(&mut caps, &seq) {
+                if apply(&mut caps, &seq) && !tmux {
                     break 'read;
+                }
+                if caps.responded {
+                    if caps.kitty_graphics {
+                        break 'read;
+                    }
+                    deadline = deadline.min(Instant::now() + TMUX_GRACE);
                 }
             }
         }
@@ -296,6 +312,14 @@ mod tests {
         assert!(!caps.kitty_graphics);
         let (caps, done) = run(&[b"typed ahead\x1b[?64;4c"]);
         assert!(done && !caps.kitty_graphics && caps.cell.is_none());
+    }
+
+    #[test]
+    fn inside_tmux_the_graphics_query_is_wrapped() {
+        let wrapped = queries(true);
+        assert!(wrapped.starts_with(b"\x1bPtmux;\x1b\x1b_Gi=31"));
+        assert!(wrapped.ends_with(b"\x1b[c"));
+        assert!(queries(false).starts_with(b"\x1b_Gi=31"));
     }
 
     #[test]
