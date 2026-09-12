@@ -1,0 +1,17 @@
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant M as mer
+    participant T as Ghostty
+    U->>M: cat diagram.mmd | mer -
+    M->>T: CSI 16 t (cell size?)
+    T-->>M: cell is 17x38 px
+    M->>T: OSC 11 ? (background?)
+    T-->>M: rgb:1e1e/1e1e/2e2e
+    Note over M: parse, layout, rasterize
+    M->>T: APC G a=T,f=100 (chunked)
+    T-->>U: diagram appears inline
+    loop follow mode
+        M->>M: debounce new stdin bytes
+        M->>T: replace image i=1 in place
+    end

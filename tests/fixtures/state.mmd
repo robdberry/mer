@@ -1,0 +1,8 @@
+stateDiagram-v2
+    [*] --> Reading
+    Reading --> Rendering: EOF or idle 150ms
+    Rendering --> Displayed: ok
+    Rendering --> ErrorShown: parse error
+    Displayed --> Reading: more input (follow)
+    ErrorShown --> Reading: more input
+    Displayed --> [*]: q or EOF

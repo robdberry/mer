@@ -1,0 +1,13 @@
+flowchart TD
+    subgraph input [Input]
+        A[File path] --> R{Source kind?}
+        S[stdin pipe] --> R
+    end
+    R -->|.mmd| P[Parse]
+    R -->|.md| X[Extract mermaid fences] --> P
+    P --> L[Layout]
+    L --> V[SVG]
+    V --> Ras[(Rasterize with resvg)]
+    Ras --> K[/Kitty graphics protocol/]
+    K --> T([Ghostty])
+    P -. syntax error .-> E[Diagnostic with code frame]

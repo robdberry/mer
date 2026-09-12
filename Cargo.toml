@@ -1,0 +1,34 @@
+[package]
+name = "mer-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Render Mermaid diagrams as graphics in the terminal"
+
+[[bin]]
+name = "mer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.6", features = ["derive"] }
+flate2 = "1.1.10"
+harfrust = "0.12"
+merman = { version = "=0.8.0-alpha.6", default-features = false, features = ["svg", "layout-cytoscape"] }
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+rustix = { version = "1.1.4", features = ["termios", "fs", "mm", "shm", "stdio", "process", "event"] }
+serde_json = "1.0.151"
+signal-hook = "0.3"
+skrifa = "0.44"
+
+[dev-dependencies]
+libc = "0.2"
+
+# Layout and rasterization are slow unoptimized, so dependencies are optimized in debug builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,22 @@
+classDiagram
+    class Engine {
+        <<trait>>
+        +render(src, opts) Result~Svg~
+        +supports(kind) bool
+    }
+    class NativeEngine
+    class BrowserEngine {
+        -session: CdpSession
+    }
+    class Display {
+        <<trait>>
+        +show(img, placement)
+    }
+    class KittyDisplay
+    class HalfBlockDisplay
+    Engine <|.. NativeEngine
+    Engine <|.. BrowserEngine
+    Display <|.. KittyDisplay
+    Display <|.. HalfBlockDisplay
+    App o-- Engine
+    App o-- Display
