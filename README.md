@@ -34,10 +34,12 @@ raise that with `MER_PROBE_TIMEOUT_MS`.
 ## Install
 
 ```sh
-cargo install --locked --path .
+cargo install --locked mer-cli
 ```
 
-`--locked` keeps the dependency versions in `Cargo.lock`, which the tests run against.
+The crate is named `mer-cli`, and the command it installs is `mer`. `--locked` keeps the
+dependency versions in `Cargo.lock`, which the tests run against. To build from a clone instead,
+run `cargo install --locked --path .`.
 
 ## Usage
 
