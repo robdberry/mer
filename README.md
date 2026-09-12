@@ -28,11 +28,16 @@ Check what `mer` detects in your terminal:
 mer --doctor
 ```
 
+`mer` waits up to 500 ms for the terminal to answer its queries. Over a slow remote connection,
+raise that with `MER_PROBE_TIMEOUT_MS`.
+
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --locked --path .
 ```
+
+`--locked` keeps the dependency versions in `Cargo.lock`, which the tests run against.
 
 ## Usage
 
@@ -118,11 +123,13 @@ set -g allow-passthrough on
 
 ```sh
 mer flow.mmd -o flow.png          # 2x PNG; --scale changes the size
+mer flow.mmd -o - --format png    # PNG on stdout
 mer docs/guide.md -o guide.svg    # guide-1.svg, guide-2.svg, …
 mer --check docs/*.md             # report syntax errors; exits 1 if any
 ```
 
-Exports use Mermaid's `default` theme on white unless `-t` or `-b` say otherwise.
+Exports use Mermaid's `default` theme on white unless `-t`, `-b` or the configuration file say
+otherwise.
 
 ## Configuration
 
@@ -130,8 +137,6 @@ Defaults can be set in `~/.config/mer/config.toml`, or `$XDG_CONFIG_HOME/mer/con
 file named by `MER_CONFIG`. Flags override it.
 
 ```toml
-theme = "terminal"
-background = "transparent"
 scale = 1.2
 fit = "width"          # width, contain or none
 protocol = "auto"      # auto, kitty or text
@@ -140,7 +145,9 @@ protocol = "auto"      # auto, kitty or text
 flowchart.curve = "basis"
 ```
 
-`mer --doctor` shows which configuration file is in use.
+`theme` and `background` can be set the same way. Like the flags, they apply to exports too, so
+`theme = "terminal"` in the file makes exported images transparent. `mer --doctor` shows which
+configuration file is in use.
 
 ## Limitations
 
