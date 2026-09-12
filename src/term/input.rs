@@ -1,4 +1,4 @@
-//! Keys, mouse events and terminal reports read from the tty in live and interactive modes.
+//! What the terminal sends mer: keys, mouse events, and replies to its queries.
 
 use crate::theme::Rgb;
 
@@ -46,7 +46,7 @@ pub struct Mouse {
 pub enum Event {
     Key(Key),
     Mouse(Mouse),
-    /// The terminal switched between light and dark (mode 2031).
+    /// The terminal's light or dark preference, reported on request or when it switches.
     ColorScheme { dark: bool },
     /// In-band resize report (mode 2048), with the text area in pixels.
     Resize {
@@ -57,6 +57,14 @@ pub enum Event {
     },
     /// A color query reply: 10 is the foreground, 11 the background, others palette indexes.
     Color { index: u16, rgb: Rgb },
+    /// The cell size in pixels, in reply to `CSI 16 t`.
+    CellSize { width: u32, height: u32 },
+    /// The text area size in pixels, in reply to `CSI 14 t`.
+    TextArea { width: u32, height: u32 },
+    /// A kitty graphics protocol reply about image `id`.
+    Graphics { id: u32, ok: bool },
+    /// The reply to a primary device attributes query (DA1).
+    DeviceAttributes,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,14 +74,21 @@ enum State {
     Escape,
     Csi,
     Ss3,
-    Osc,
-    OscEscape,
-    /// APC and DCS strings, which carry nothing mer reads here.
-    Ignore,
-    IgnoreEscape,
+    Str(Kind),
+    /// An ESC inside a string, which ends it when `\` follows.
+    StrEscape(Kind),
 }
 
-/// Incremental input decoder.
+/// Strings the terminal sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Osc,
+    Apc,
+    /// DCS strings carry nothing mer reads.
+    Dcs,
+}
+
+/// Incremental decoder for everything the terminal sends.
 #[derive(Default)]
 pub struct Decoder {
     state: State,
@@ -113,8 +128,9 @@ impl Decoder {
                 self.state = match byte {
                     b'[' => State::Csi,
                     b'O' => State::Ss3,
-                    b']' => State::Osc,
-                    b'_' | b'P' => State::Ignore,
+                    b']' => State::Str(Kind::Osc),
+                    b'_' => State::Str(Kind::Apc),
+                    b'P' => State::Str(Kind::Dcs),
                     0x1b => {
                         events.push(Event::Key(Key::Escape));
                         State::Escape
@@ -150,36 +166,22 @@ impl Decoder {
                 };
                 events.push(Event::Key(key));
             }
-            State::Osc => match byte {
+            State::Str(kind) => match byte {
                 0x07 => {
                     self.state = State::Ground;
-                    events.extend(osc(&self.params));
+                    events.extend(string(kind, &self.params));
                 }
-                0x1b => self.state = State::OscEscape,
+                0x1b => self.state = State::StrEscape(kind),
                 _ => self.push(byte),
             },
-            State::OscEscape => {
+            State::StrEscape(kind) => {
                 self.state = State::Ground;
                 if byte == b'\\' {
-                    events.extend(osc(&self.params));
+                    events.extend(string(kind, &self.params));
                 } else {
                     self.byte(0x1b, events);
                     self.byte(byte, events);
                 }
-            }
-            State::Ignore => {
-                if byte == 0x1b {
-                    self.state = State::IgnoreEscape;
-                } else if byte == 0x07 {
-                    self.state = State::Ground;
-                }
-            }
-            State::IgnoreEscape => {
-                self.state = if byte == b'\\' {
-                    State::Ground
-                } else {
-                    State::Ignore
-                };
             }
         }
     }
@@ -237,6 +239,7 @@ fn csi(params: &str, final_byte: u8) -> Option<Event> {
             _ => return None,
         },
         (b'M' | b'm', _) if params.starts_with('<') => return mouse(&params[1..], final_byte),
+        (b'c', _) if params.starts_with('?') => return Some(Event::DeviceAttributes),
         (b'n', "?997;1") => return Some(Event::ColorScheme { dark: true }),
         (b'n', "?997;2") => return Some(Event::ColorScheme { dark: false }),
         (b't', _) => {
@@ -248,6 +251,12 @@ fn csi(params: &str, final_byte: u8) -> Option<Event> {
                     width,
                     height,
                 }),
+                [6, height, width] if width > 0 && height > 0 => {
+                    Some(Event::CellSize { width, height })
+                }
+                [4, height, width] if width > 0 && height > 0 => {
+                    Some(Event::TextArea { width, height })
+                }
                 _ => None,
             };
         }
@@ -296,6 +305,25 @@ fn osc(body: &str) -> Option<Event> {
         index,
         rgb: Rgb::parse_x11(spec)?,
     })
+}
+
+/// A kitty graphics reply such as `Gi=31;OK`.
+fn apc(body: &str) -> Option<Event> {
+    let (keys, message) = body.strip_prefix('G')?.split_once(';')?;
+    let id = keys.split(',').find_map(|key| key.strip_prefix("i="))?;
+    Some(Event::Graphics {
+        id: id.parse().ok()?,
+        ok: message == "OK",
+    })
+}
+
+/// What an OSC or APC string reports, if it is something mer reads.
+fn string(kind: Kind, body: &str) -> Option<Event> {
+    match kind {
+        Kind::Osc => osc(body),
+        Kind::Apc => apc(body),
+        Kind::Dcs => None,
+    }
 }
 
 #[cfg(test)]
@@ -408,9 +436,29 @@ mod tests {
     }
 
     #[test]
+    fn probe_replies() {
+        assert_eq!(
+            keys(b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=31;ENOTSUPPORTED:no\x07\x1b[6;34;17t\x1b[4;1360;2890t\x1b[?62;22c"),
+            [
+                Event::Graphics { id: 31, ok: true },
+                Event::Graphics { id: 31, ok: false },
+                Event::CellSize {
+                    width: 17,
+                    height: 34
+                },
+                Event::TextArea {
+                    width: 2890,
+                    height: 1360
+                },
+                Event::DeviceAttributes,
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_sequences_are_skipped() {
         assert_eq!(
-            keys(b"\x1b_Gi=1;OK\x1b\\\x1bP1$r0m\x1b\\\x1b[?62;22cx"),
+            keys(b"\x1b_Xnot graphics\x1b\\\x1bP1$r0m\x1b\\\x1b[>1;10;0c\x1b[5nx"),
             [Event::Key(Key::Char('x'))]
         );
     }

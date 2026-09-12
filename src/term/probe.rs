@@ -7,8 +7,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
+use super::input::{Decoder, Event};
 use super::tty::Tty;
-use crate::theme::{Palette, Rgb};
+use crate::theme::Palette;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Caps {
@@ -26,14 +27,14 @@ pub struct Caps {
     pub responded: bool,
 }
 
-const KITTY_QUERY_ID: &str = "i=31";
+const KITTY_QUERY_ID: u32 = 31;
 
 /// How long to wait for graphics replies after tmux has answered DA1 itself: tmux replies at
 /// once, while passthrough replies travel from the terminal behind it.
 const TMUX_GRACE: Duration = Duration::from_millis(250);
 
 pub fn queries(tmux: bool) -> Vec<u8> {
-    let kitty = format!("\x1b_G{KITTY_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    let kitty = format!("\x1b_Gi={KITTY_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
     let mut q = if tmux {
         super::passthrough(kitty.as_bytes())
     } else {
@@ -66,7 +67,7 @@ pub fn probe(tty: &Tty, timeout: Duration) -> io::Result<Caps> {
         let _raw = tty.raw(false)?;
         tty.write_all(&queries(tmux))?;
         let mut deadline = Instant::now() + timeout;
-        let mut parser = Parser::default();
+        let mut decoder = Decoder::default();
         let mut buf = [0u8; 4096];
         'read: while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             let n = match tty.read_timeout(&mut buf, left)? {
@@ -74,8 +75,8 @@ pub fn probe(tty: &Tty, timeout: Duration) -> io::Result<Caps> {
                 Some(0) => break,
                 Some(n) => n,
             };
-            for seq in parser.feed(&buf[..n]) {
-                if apply(&mut caps, &seq) && !tmux {
+            for event in decoder.feed(&buf[..n]) {
+                if apply(&mut caps, event) && !tmux {
                     break 'read;
                 }
                 if caps.responded {
@@ -107,166 +108,26 @@ fn cell_size(pixels: Option<(u32, u32)>, cols: u16, rows: u16) -> Option<(u32, u
 }
 
 /// Records one reply. Returns true for the DA1 reply that ends the probe.
-fn apply(caps: &mut Caps, seq: &Seq) -> bool {
-    match seq {
-        Seq::Apc(body) => {
-            if let Some(rest) = body.strip_prefix('G') {
-                let (keys, message) = rest.split_once(';').unwrap_or((rest, ""));
-                if keys.split(',').any(|kv| kv == KITTY_QUERY_ID) {
-                    caps.kitty_graphics = message == "OK";
-                }
-            }
+fn apply(caps: &mut Caps, event: Event) -> bool {
+    match event {
+        Event::DeviceAttributes => {
+            caps.responded = true;
+            return true;
         }
-        Seq::Csi(body) => {
-            if body.starts_with('?') && body.ends_with('c') {
-                caps.responded = true;
-                return true;
-            }
-            if let Some(mode) = body.strip_prefix("?997;").and_then(|b| b.strip_suffix('n')) {
-                match mode {
-                    "1" => caps.dark = Some(true),
-                    "2" => caps.dark = Some(false),
-                    _ => {}
-                }
-            } else if let Some(params) = body.strip_suffix('t') {
-                let numbers: Vec<u32> = params.split(';').filter_map(|p| p.parse().ok()).collect();
-                match numbers[..] {
-                    [6, h, w] if w > 0 && h > 0 => caps.cell = Some((w, h)),
-                    [4, h, w] if w > 0 && h > 0 => caps.text_area = Some((w, h)),
-                    _ => {}
-                }
-            }
-        }
-        Seq::Osc(body) => {
-            let mut parts = body.splitn(3, ';');
-            let reply = match (parts.next(), parts.next(), parts.next()) {
-                (Some(index @ ("10" | "11")), Some(spec), None) => Some((index, spec)),
-                (Some("4"), Some(index), Some(spec)) => Some((index, spec)),
-                _ => None,
-            };
-            if let Some((index, spec)) = reply
-                && let (Ok(index), Some(color)) = (index.parse(), Rgb::parse_x11(spec))
-            {
-                caps.palette.set(index, color);
-            }
-        }
+        Event::Graphics { id, ok } if id == KITTY_QUERY_ID => caps.kitty_graphics = ok,
+        Event::CellSize { width, height } => caps.cell = Some((width, height)),
+        Event::TextArea { width, height } => caps.text_area = Some((width, height)),
+        Event::Color { index, rgb } => caps.palette.set(index, rgb),
+        Event::ColorScheme { dark } => caps.dark = Some(dark),
+        _ => {}
     }
     false
-}
-
-/// A control sequence received from the terminal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Seq {
-    /// Parameters and final byte of a CSI sequence, e.g. `6;34;17t`.
-    Csi(String),
-    /// Body of an OSC string, e.g. `11;rgb:1e1e/1e1e/2e2e`.
-    Osc(String),
-    /// Body of an APC string, e.g. `Gi=31;OK`.
-    Apc(String),
-}
-
-/// Incremental parser for terminal replies. Bytes outside escape sequences are ignored.
-#[derive(Default)]
-pub struct Parser {
-    state: State,
-    body: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Osc,
-    Apc,
-    Dcs,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum State {
-    #[default]
-    Ground,
-    Escape,
-    Csi,
-    Str(Kind),
-    StrEscape(Kind),
-}
-
-const MAX_BODY: usize = 1 << 16;
-
-impl Parser {
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Seq> {
-        let mut out = Vec::new();
-        for &byte in bytes {
-            self.state = match self.state {
-                State::Ground if byte == 0x1b => State::Escape,
-                State::Ground => State::Ground,
-                State::Escape => self.after_escape(byte),
-                State::Csi => match byte {
-                    0x1b => State::Escape,
-                    0x40..=0x7e => {
-                        self.push(byte);
-                        out.push(Seq::Csi(self.take()));
-                        State::Ground
-                    }
-                    _ => {
-                        self.push(byte);
-                        State::Csi
-                    }
-                },
-                State::Str(kind) => match byte {
-                    0x07 => {
-                        self.emit(kind, &mut out);
-                        State::Ground
-                    }
-                    0x1b => State::StrEscape(kind),
-                    _ => {
-                        self.push(byte);
-                        State::Str(kind)
-                    }
-                },
-                State::StrEscape(kind) if byte == b'\\' => {
-                    self.emit(kind, &mut out);
-                    State::Ground
-                }
-                State::StrEscape(_) => self.after_escape(byte),
-            };
-        }
-        out
-    }
-
-    fn after_escape(&mut self, byte: u8) -> State {
-        self.body.clear();
-        match byte {
-            b'[' => State::Csi,
-            b']' => State::Str(Kind::Osc),
-            b'_' => State::Str(Kind::Apc),
-            b'P' => State::Str(Kind::Dcs),
-            0x1b => State::Escape,
-            _ => State::Ground,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.body.len() < MAX_BODY {
-            self.body.push(byte);
-        }
-    }
-
-    fn take(&mut self) -> String {
-        String::from_utf8_lossy(&std::mem::take(&mut self.body)).into_owned()
-    }
-
-    fn emit(&mut self, kind: Kind, out: &mut Vec<Seq>) {
-        let body = self.take();
-        match kind {
-            Kind::Osc => out.push(Seq::Osc(body)),
-            Kind::Apc => out.push(Seq::Apc(body)),
-            Kind::Dcs => {}
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Rgb;
 
     const GHOSTTY_REPLIES: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;34;17t\x1b[4;1360;2890t\
 \x1b]10;rgb:d8d8/dada/dede\x1b\\\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\
@@ -275,11 +136,11 @@ mod tests {
 
     fn run(chunks: &[&[u8]]) -> (Caps, bool) {
         let mut caps = Caps::default();
-        let mut parser = Parser::default();
+        let mut decoder = Decoder::default();
         let mut done = false;
         for chunk in chunks {
-            for seq in parser.feed(chunk) {
-                done |= apply(&mut caps, &seq);
+            for event in decoder.feed(chunk) {
+                done |= apply(&mut caps, event);
             }
         }
         (caps, done)
