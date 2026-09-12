@@ -686,13 +686,30 @@ fn terminals_without_graphics_get_text_diagrams() {
     assert!(text.contains("Rasterize") && text.contains('─'), "{text}");
 }
 
+/// Five boxes in a row, 132 columns wide as text: wider than the test terminal.
+const WIDE_FLOWCHART: &str = "flowchart LR\n  A[Read the input] --> B[Parse the diagram] --> \
+    C[Lay out the nodes] --> D[Rasterize the picture] --> E[Send it to the terminal]\n";
+
+#[test]
+fn text_wider_than_the_terminal_is_an_error() {
+    let path = scratch_file("wide.mmd", WIDE_FLOWCHART);
+    let run = run_in_terminal(&[path.to_str().unwrap()], None, PLAIN_TERMINAL);
+    assert_eq!(run.status, 1, "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("columns wide but the terminal has 120;"), "{}", run.stderr);
+    assert!(!String::from_utf8_lossy(&run.output).contains("Rasterize the picture"));
+}
+
 #[test]
 fn text_protocol_works_without_a_terminal() {
-    let path = scratch_file("text.mmd", "flowchart LR\n  A[Parse] --> B[Layout] --> C[Rasterize]\n");
+    // Nothing wraps lines in a pipe, so the drawing is not limited to any width.
+    let path = scratch_file("text.mmd", WIDE_FLOWCHART);
     let run = run_plain(&["--protocol", "text", path.to_str().unwrap()]);
     assert_eq!(run.status, 0, "{}", run.stderr);
     let text = String::from_utf8_lossy(&run.output);
-    assert!(text.contains("Layout") && !text.contains('\x1b'), "{text}");
+    assert!(text.contains('┌') && text.contains("Rasterize the picture"), "{text}");
+    assert!(!text.contains('\x1b'), "{text}");
+    let widest = text.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+    assert!(widest > usize::from(COLS), "{text}");
 }
 
 #[test]

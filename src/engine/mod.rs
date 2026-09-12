@@ -2,7 +2,7 @@
 
 mod measure;
 
-use merman::ascii::{AsciiRenderOptions, AsciiViewportPolicy, OverflowPolicy};
+use merman::ascii::{AsciiError, AsciiRenderOptions, AsciiViewportPolicy, OverflowPolicy};
 use merman::svg::{RootBackgroundPostprocessor, SvgPipeline};
 use merman::{
     AsciiRequest, MermaidConfig, ParseOptions, RenderError, RenderOutput, RenderRequest, Renderer,
@@ -58,17 +58,31 @@ impl Engine {
         }
     }
 
-    /// Draws one diagram with Unicode box-drawing characters, at most `width` columns wide
-    /// where the diagram allows.
-    pub fn render_text(&self, source: &str, width: usize) -> Result<String, Failure> {
+    /// Draws one diagram with Unicode box-drawing characters. A drawing wider than `max_width`
+    /// columns is an error, because merman's fallback for drawings that don't fit lists its
+    /// internal model instead.
+    pub fn render_text(&self, source: &str, max_width: Option<usize>) -> Result<String, Failure> {
+        let viewport = match max_width {
+            Some(width) => AsciiViewportPolicy::with_max_width(width).overflow(OverflowPolicy::Error),
+            None => AsciiViewportPolicy::unrestricted(),
+        };
         let request = AsciiRequest {
             options: AsciiRenderOptions::unicode(),
-            viewport: AsciiViewportPolicy::with_max_width(width).overflow(OverflowPolicy::Fallback),
+            viewport,
             ..AsciiRequest::default()
         };
         match self.renderer.render(RenderRequest::ascii(source, Control::new(), request)) {
             Ok(RenderOutput::Ascii(Some(output))) => Ok(output.text),
             Ok(_) => Err(Failure::Empty),
+            Err(RenderError::Ascii(AsciiError::WidthOverflow { max_width, actual_width, .. })) => {
+                Err(Failure::Diagnostic(Diagnostic {
+                    message: format!(
+                        "the diagram is {actual_width} columns wide but the terminal has \
+                         {max_width}; widen the terminal or write an image with -o FILE"
+                    ),
+                    span: None,
+                }))
+            }
             Err(RenderError::Ascii(err)) => Err(Failure::Diagnostic(Diagnostic {
                 message: format!("{err}; write an image with -o FILE instead"),
                 span: None,
@@ -157,16 +171,27 @@ mod tests {
     #[test]
     fn draws_diagrams_as_text() {
         let text = engine()
-            .render_text("flowchart LR\n  A[Start] --> B[Done]\n", 80)
+            .render_text("flowchart LR\n  A[Start] --> B[Done]\n", Some(80))
             .unwrap();
         assert!(text.contains("Start") && text.contains("Done"), "{text}");
         assert!(text.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c)), "{text}");
     }
 
     #[test]
+    fn text_wider_than_the_terminal_is_an_error() {
+        let source = "flowchart LR\n  A[Read the input] --> B[Parse the diagram] --> C[Send it]\n";
+        let Err(Failure::Diagnostic(diagnostic)) = engine().render_text(source, Some(40)) else {
+            panic!("the drawing should not fit in 40 columns");
+        };
+        assert!(diagnostic.message.contains("but the terminal has 40;"), "{}", diagnostic.message);
+        let text = engine().render_text(source, None).unwrap();
+        assert!(text.lines().any(|line| line.chars().count() > 40), "{text}");
+    }
+
+    #[test]
     fn text_output_names_what_it_cannot_draw() {
         let Err(Failure::Diagnostic(diagnostic)) =
-            engine().render_text("pie\n  \"Dogs\" : 3\n", 80)
+            engine().render_text("pie\n  \"Dogs\" : 3\n", Some(80))
         else {
             panic!("pie charts have no text rendering");
         };

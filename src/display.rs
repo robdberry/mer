@@ -162,14 +162,15 @@ pub fn show(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
 
 fn show_text(setup: &Setup, diagrams: &[Diagram]) -> Result<ExitCode> {
     let engine = Engine::new(setup.config.clone(), None);
-    let width = usize::from(setup.grid.cols.max(20));
-    let styled = io::stdout().is_terminal();
+    let terminal = io::stdout().is_terminal();
+    // A terminal wraps lines wider than itself, garbling the drawing; pipes and files don't.
+    let max_width = (terminal && setup.caps.cols > 0).then_some(usize::from(setup.caps.cols));
     let mut stdout = io::stdout().lock();
     let mut failed = false;
     for diagram in diagrams {
-        match engine.render_text(&diagram.text, width) {
+        match engine.render_text(&diagram.text, max_width) {
             Ok(text) => {
-                match (&diagram.caption, styled) {
+                match (&diagram.caption, terminal) {
                     (Some(caption), true) => writeln!(stdout, "\x1b[2m{caption}\x1b[22m")?,
                     (Some(caption), false) => writeln!(stdout, "{caption}")?,
                     (None, _) => {}

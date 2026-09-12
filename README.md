@@ -100,9 +100,11 @@ directives, take precedence over both.
 
 In terminals without the kitty graphics protocol, `mer` draws diagrams with box-drawing
 characters and says so on stderr. `--protocol text` does the same on purpose, including when
-output goes to a pipe or a CI log. Text renderings exist for flowcharts, sequence, class and ER
-diagrams, gantt charts, journeys, git graphs, mindmaps, timelines, XY charts, packet and kanban
-diagrams, and for state diagrams with simple layouts. For other types, write an image with `-o`.
+output goes to a pipe or a CI log. A drawing wider than the terminal is reported as an error,
+because wrapped lines would garble it; output to a pipe or file has no width limit. Text
+renderings exist for flowcharts, sequence, class and ER diagrams, gantt charts, journeys, git
+graphs, mindmaps, timelines, XY charts, packet and kanban diagrams, and for state diagrams with
+simple layouts. For other types, write an image with `-o`.
 
 ### tmux
 

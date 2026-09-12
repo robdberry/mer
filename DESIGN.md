@@ -556,6 +556,7 @@ Where the implementation departs from the proposal above, and why.
 
 **No graphics.**
 - Without kitty graphics, diagrams are drawn by merman's Unicode renderer, and `--protocol text` forces it.
+- A drawing wider than the terminal is an error. Wrapped lines garble it, and merman's fallback for drawings that don't fit lists its internal model instead. Output to a pipe or file has no width limit.
 - Live modes and the viewer need images.
 
 **tmux.**
